@@ -588,6 +588,8 @@ def _main():
         syslog_port=None,
         gmail_api_credentials_file=None,
         gmail_api_token_file=None,
+        gmail_api_service_account_file=None, # Add this
+        gmail_api_delegated_account=None,   # Add this
         gmail_api_include_spam_trash=False,
         gmail_api_paginate_messages=True,
         gmail_api_scopes=[],
@@ -1105,6 +1107,8 @@ def _main():
             gmail_api_config = config["gmail_api"]
             opts.gmail_api_credentials_file = gmail_api_config.get("credentials_file")
             opts.gmail_api_token_file = gmail_api_config.get("token_file", ".token")
+            opts.gmail_api_service_account_file = gmail_api_config.get("service_account_file")
+            opts.gmail_api_delegated_account = gmail_api_config.get("delegated_account")
             opts.gmail_api_include_spam_trash = gmail_api_config.getboolean(
                 "include_spam_trash", False
             )
@@ -1495,7 +1499,7 @@ def _main():
             )
 
         except Exception:
-            logger.exception("MS Graph Error")
+            logger.exception("MS Graph Error")  
             exit(1)
 
     if opts.gmail_api_credentials_file:
@@ -1517,7 +1521,9 @@ def _main():
                 include_spam_trash=opts.gmail_api_include_spam_trash,
                 paginate_messages=opts.gmail_api_paginate_messages,
                 reports_folder=opts.mailbox_reports_folder,
-                oauth2_port=opts.gmail_api_oauth2_port,
+                oauth2_port=opts.gmail_api_oauth2_port, 
+                service_account_file=opts.gmail_api_service_account_file,
+                delegated_account=opts.gmail_api_delegated_account,
             )
 
         except Exception:
