@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - master
+      - dev
 
 env:
   REGISTRY: ghcr.io
@@ -17,10 +18,13 @@ env:
 
 jobs:
   build-and-push-image:
-    runs-on: arc-runner-set-01 # <-- Change: Use your local runners
+    runs-on: arc-runner-set-01
     permissions:
       contents: read
       packages: write
+    # Add this environment variable to the job
+    env:
+      DOCKER_HOST: unix:///home/runner/var/run/docker.sock
 
     steps:
       - name: Checkout repository
@@ -32,7 +36,6 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # generate Docker tags based on the following events/attributes
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -40,7 +43,6 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Log in to the Container registry
-        # https://github.com/docker/login-action/releases/tag/v2.0.0
         uses: docker/login-action@49ed152c8eca782a232dede0303416e8f356c37b
         with:
           registry: ${{ env.REGISTRY }}
@@ -48,10 +50,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
-        # https://github.com/docker/build-push-action/releases/tag/v3.0.0
         uses: docker/build-push-action@e551b19e49efd4e98792db7592c17c09b89db8d8
         with:
           context: .
-          push: true # <-- Change: Always push the image on successful triggers
+          push: true
           tags:  ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
