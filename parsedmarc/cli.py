@@ -1195,7 +1195,7 @@ def _main():
     if (
         opts.imap_host is None
         and opts.graph_client_id is None
-        and opts.gmail_api_credentials_file is None
+        and (opts.gmail_api_credentials_file is None and opts.gmail_api_service_account_file is None)
         and opts.maildir_path is None
         and len(opts.file_path) == 0
     ):
