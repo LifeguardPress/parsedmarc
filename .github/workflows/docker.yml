@@ -17,7 +17,7 @@ env:
 
 jobs:
   build-and-push-image:
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set-01 # <-- Change: Use your local runners
     permissions:
       contents: read
       packages: write
@@ -52,6 +52,6 @@ jobs:
         uses: docker/build-push-action@e551b19e49efd4e98792db7592c17c09b89db8d8
         with:
           context: .
-          push: ${{ github.event_name == 'release' }}
+          push: true # <-- Change: Always push the image on successful triggers
           tags:  ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
