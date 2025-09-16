@@ -102,11 +102,19 @@ def _main():
     """Called when the module is executed"""
 
     def process_reports(reports_):
+        """Processes and saves the parsed reports"""
+        logger.info(
+            "Processing %d aggregate, %d forensic, and %d SMTP TLS reports",
+            len(reports_["aggregate_reports"]),
+            len(reports_["forensic_reports"]),
+            len(reports_["smtp_tls_reports"]),
+        )
         output_str = "{0}\n".format(json.dumps(reports_, ensure_ascii=False, indent=2))
 
         if not opts.silent:
             print(output_str)
         if opts.output:
+            logger.info("Saving report files to %s", opts.output)
             save_output(
                 results,
                 output_directory=opts.output,
@@ -118,6 +126,7 @@ def _main():
                 smtp_tls_csv_filename=opts.smtp_tls_csv_filename,
             )
         if opts.save_aggregate:
+            logger.info("Saving aggregate reports...")
             for report in reports_["aggregate_reports"]:
                 try:
                     if opts.elasticsearch_hosts:
@@ -195,15 +204,17 @@ def _main():
                 except Exception as error_:
                     logger.error("Webhook Error: {0}".format(error_.__str__()))
 
-            if opts.hec:
-                try:
-                    aggregate_reports_ = reports_["aggregate_reports"]
-                    if len(aggregate_reports_) > 0:
-                        hec_client.save_aggregate_reports_to_splunk(aggregate_reports_)
-                except splunk.SplunkError as e:
-                    logger.error("Splunk HEC error: {0}".format(e.__str__()))
+        if opts.hec:
+            try:
+                aggregate_reports_ = reports_["aggregate_reports"]
+                if len(aggregate_reports_) > 0:
+                    logger.info("Saving aggregate reports to Splunk HEC...")
+                    hec_client.save_aggregate_reports_to_splunk(aggregate_reports_)
+            except splunk.SplunkError as e:
+                logger.error("Splunk HEC error: {0}".format(e.__str__()))
 
         if opts.save_forensic:
+            logger.info("Saving forensic reports...")
             for report in reports_["forensic_reports"]:
                 try:
                     shards = opts.elasticsearch_number_of_shards
@@ -277,15 +288,17 @@ def _main():
                 except Exception as error_:
                     logger.error("Webhook Error: {0}".format(error_.__str__()))
 
-            if opts.hec:
-                try:
-                    forensic_reports_ = reports_["forensic_reports"]
-                    if len(forensic_reports_) > 0:
-                        hec_client.save_forensic_reports_to_splunk(forensic_reports_)
-                except splunk.SplunkError as e:
-                    logger.error("Splunk HEC error: {0}".format(e.__str__()))
+        if opts.hec:
+            try:
+                forensic_reports_ = reports_["forensic_reports"]
+                if len(forensic_reports_) > 0:
+                    logger.info("Saving forensic reports to Splunk HEC...")
+                    hec_client.save_forensic_reports_to_splunk(forensic_reports_)
+            except splunk.SplunkError as e:
+                logger.error("Splunk HEC error: {0}".format(e.__str__()))
 
         if opts.save_smtp_tls:
+            logger.info("Saving SMTP TLS reports...")
             for report in reports_["smtp_tls_reports"]:
                 try:
                     shards = opts.elasticsearch_number_of_shards
@@ -359,15 +372,17 @@ def _main():
                 except Exception as error_:
                     logger.error("Webhook Error: {0}".format(error_.__str__()))
 
-            if opts.hec:
-                try:
-                    smtp_tls_reports_ = reports_["smtp_tls_reports"]
-                    if len(smtp_tls_reports_) > 0:
-                        hec_client.save_smtp_tls_reports_to_splunk(smtp_tls_reports_)
-                except splunk.SplunkError as e:
-                    logger.error("Splunk HEC error: {0}".format(e.__str__()))
+        if opts.hec:
+            try:
+                smtp_tls_reports_ = reports_["smtp_tls_reports"]
+                if len(smtp_tls_reports_) > 0:
+                    logger.info("Saving SMTP TLS reports to Splunk HEC...")
+                    hec_client.save_smtp_tls_reports_to_splunk(smtp_tls_reports_)
+            except splunk.SplunkError as e:
+                logger.error("Splunk HEC error: {0}".format(e.__str__()))
 
         if opts.la_dce:
+            logger.info("Saving reports to Log Analytics...")
             try:
                 la_client = loganalytics.LogAnalyticsClient(
                     client_id=opts.la_client_id,
@@ -625,6 +640,7 @@ def _main():
         if not os.path.exists(abs_path):
             logger.error("A file does not exist at {0}".format(abs_path))
             exit(-1)
+        logger.info("Loading configuration from %s", abs_path)
         opts.silent = True
         config = ConfigParser()
         config.read(args.config_file)
@@ -1189,6 +1205,7 @@ def _main():
             )
             fh.setFormatter(formatter)
             logger.addHandler(fh)
+            logger.info("Logging to file: %s", opts.log_file)
         except Exception as error:
             logger.warning("Unable to write to log file: {}".format(error))
 
@@ -1202,11 +1219,14 @@ def _main():
         logger.error("You must supply input files or a mailbox connection")
         exit(1)
 
-    logger.info("Starting parsedmarc")
+    logger.info("Starting parsedmarc v%s", __version__)
+    logger.debug("OPTIONS: %s", opts)
+
 
     if opts.save_aggregate or opts.save_forensic or opts.save_smtp_tls:
         try:
             if opts.elasticsearch_hosts:
+                logger.info("Setting up Elasticsearch client...")
                 es_aggregate_index = "dmarc_aggregate"
                 es_forensic_index = "dmarc_forensic"
                 es_smtp_tls_index = "smtp_tls"
@@ -1239,6 +1259,7 @@ def _main():
 
         try:
             if opts.opensearch_hosts:
+                logger.info("Setting up OpenSearch client...")
                 os_aggregate_index = "dmarc_aggregate"
                 os_forensic_index = "dmarc_forensic"
                 os_smtp_tls_index = "smtp_tls"
@@ -1271,6 +1292,7 @@ def _main():
 
     if opts.s3_bucket:
         try:
+            logger.info("Setting up S3 client for bucket %s", opts.s3_bucket)
             s3_client = s3.S3Client(
                 bucket_name=opts.s3_bucket,
                 bucket_path=opts.s3_path,
@@ -1284,6 +1306,7 @@ def _main():
 
     if opts.syslog_server:
         try:
+            logger.info("Setting up Syslog client for %s", opts.syslog_server)
             syslog_client = syslog.SyslogClient(
                 server_name=opts.syslog_server,
                 server_port=int(opts.syslog_port),
@@ -1295,7 +1318,7 @@ def _main():
         if opts.hec_token is None or opts.hec_index is None:
             logger.error("HEC token and HEC index are required when using HEC URL")
             exit(1)
-
+        logger.info("Setting up Splunk HEC client for %s", opts.hec)
         verify = True
         if opts.hec_skip_certificate_verification:
             verify = False
@@ -1305,6 +1328,7 @@ def _main():
 
     if opts.kafka_hosts:
         try:
+            logger.info("Setting up Kafka client for %s", opts.kafka_hosts)
             ssl_context = None
             if opts.kafka_skip_certificate_verification:
                 logger.debug("Skipping Kafka certificate verification")
@@ -1322,6 +1346,7 @@ def _main():
 
     if opts.gelf_host:
         try:
+            logger.info("Setting up GELF client for %s", opts.gelf_host)
             gelf_client = gelf.GelfClient(
                 host=opts.gelf_host,
                 port=int(opts.gelf_port),
@@ -1336,6 +1361,7 @@ def _main():
         or opts.webhook_smtp_tls_url
     ):
         try:
+            logger.info("Setting up Webhook client...")
             webhook_client = webhook.WebhookClient(
                 aggregate_url=opts.webhook_aggregate_url,
                 forensic_url=opts.webhook_forensic_url,
@@ -1352,6 +1378,7 @@ def _main():
     file_paths = []
     mbox_paths = []
 
+    logger.info("Searching for files in specified paths...")
     for file_path in args.file_path:
         file_paths += glob(file_path)
     for file_path in file_paths:
@@ -1364,54 +1391,60 @@ def _main():
     for mbox_path in mbox_paths:
         file_paths.remove(mbox_path)
 
-    counter = 0
+    logger.info("Found %d total files, including %d mbox files.", len(file_paths) + len(mbox_paths), len(mbox_paths))
 
+    counter = 0
     results = []
 
-    if sys.stdout.isatty():
-        pbar = tqdm(total=len(file_paths))
+    if len(file_paths) > 0:
+        logger.info("Processing %d individual report files...", len(file_paths))
+        if sys.stdout.isatty():
+            pbar = tqdm(total=len(file_paths), desc="Processing files")
 
-    for batch_index in range(math.ceil(len(file_paths) / opts.n_procs)):
-        processes = []
-        connections = []
+        for batch_index in range(math.ceil(len(file_paths) / opts.n_procs)):
+            processes = []
+            connections = []
 
-        for proc_index in range(
-            opts.n_procs * batch_index, opts.n_procs * (batch_index + 1)
-        ):
-            if proc_index >= len(file_paths):
-                break
+            for proc_index in range(
+                opts.n_procs * batch_index, opts.n_procs * (batch_index + 1)
+            ):
+                if proc_index >= len(file_paths):
+                    break
 
-            parent_conn, child_conn = Pipe()
-            connections.append(parent_conn)
+                parent_conn, child_conn = Pipe()
+                connections.append(parent_conn)
 
-            process = Process(
-                target=cli_parse,
-                args=(
-                    file_paths[proc_index],
-                    opts.strip_attachment_payloads,
-                    opts.nameservers,
-                    opts.dns_timeout,
-                    opts.ip_db_path,
-                    opts.offline,
-                    opts.always_use_local_files,
-                    opts.reverse_dns_map_path,
-                    opts.reverse_dns_map_url,
-                    child_conn,
-                ),
-            )
-            processes.append(process)
+                process = Process(
+                    target=cli_parse,
+                    args=(
+                        file_paths[proc_index],
+                        opts.strip_attachment_payloads,
+                        opts.nameservers,
+                        opts.dns_timeout,
+                        opts.ip_db_path,
+                        opts.offline,
+                        opts.always_use_local_files,
+                        opts.reverse_dns_map_path,
+                        opts.reverse_dns_map_url,
+                        child_conn,
+                    ),
+                )
+                processes.append(process)
 
-        for proc in processes:
-            proc.start()
+            for proc in processes:
+                proc.start()
 
-        for conn in connections:
-            results.append(conn.recv())
+            for conn in connections:
+                results.append(conn.recv())
 
-        for proc in processes:
-            proc.join()
-            if sys.stdout.isatty():
-                counter += 1
-                pbar.update(counter - pbar.n)
+            for proc in processes:
+                proc.join()
+                if sys.stdout.isatty():
+                    counter += 1
+                    pbar.update(counter - pbar.n)
+        
+        if sys.stdout.isatty():
+            pbar.close()
 
     for result in results:
         if type(result[0]) is ParserError:
@@ -1433,27 +1466,39 @@ def _main():
                 forensic_reports.append(result[0]["report"])
             elif result[0]["report_type"] == "smtp_tls":
                 smtp_tls_reports.append(result[0]["report"])
+    
+    logger.info(
+        "Parsed %d aggregate, %d forensic, and %d SMTP TLS reports from individual files.",
+        len(aggregate_reports),
+        len(forensic_reports),
+        len(smtp_tls_reports),
+    )
 
-    for mbox_path in mbox_paths:
-        strip = opts.strip_attachment_payloads
-        reports = get_dmarc_reports_from_mbox(
-            mbox_path,
-            nameservers=opts.nameservers,
-            dns_timeout=opts.dns_timeout,
-            strip_attachment_payloads=strip,
-            ip_db_path=opts.ip_db_path,
-            always_use_local_files=opts.always_use_local_files,
-            reverse_dns_map_path=opts.reverse_dns_map_path,
-            reverse_dns_map_url=opts.reverse_dns_map_url,
-            offline=opts.offline,
-        )
-        aggregate_reports += reports["aggregate_reports"]
-        forensic_reports += reports["forensic_reports"]
-        smtp_tls_reports += reports["smtp_tls_reports"]
+    if len(mbox_paths) > 0:
+        logger.info("Processing %d mbox files...", len(mbox_paths))
+        for mbox_path in mbox_paths:
+            logger.debug("Processing mbox: %s", mbox_path)
+            strip = opts.strip_attachment_payloads
+            reports = get_dmarc_reports_from_mbox(
+                mbox_path,
+                nameservers=opts.nameservers,
+                dns_timeout=opts.dns_timeout,
+                strip_attachment_payloads=strip,
+                ip_db_path=opts.ip_db_path,
+                always_use_local_files=opts.always_use_local_files,
+                reverse_dns_map_path=opts.reverse_dns_map_path,
+                reverse_dns_map_url=opts.reverse_dns_map_url,
+                offline=opts.offline,
+            )
+            aggregate_reports += reports["aggregate_reports"]
+            forensic_reports += reports["forensic_reports"]
+            smtp_tls_reports += reports["smtp_tls_reports"]
+        logger.info("Finished processing mbox files.")
 
     mailbox_connection = None
     if opts.imap_host:
         try:
+            logger.info("Connecting to IMAP host: %s", opts.imap_host)
             if opts.imap_user is None or opts.imap_password is None:
                 logger.error(
                     "IMAP user and password must be specified ifhost is specified"
@@ -1484,6 +1529,7 @@ def _main():
 
     if opts.graph_client_id:
         try:
+            logger.info("Connecting to MS Graph API...")
             mailbox = opts.graph_mailbox or opts.graph_user
             mailbox_connection = MSGraphConnection(
                 auth_method=opts.graph_auth_method,
@@ -1499,10 +1545,11 @@ def _main():
             )
 
         except Exception:
-            logger.exception("MS Graph Error")  
+            logger.exception("MS Graph Error") 
             exit(1)
 
-    if opts.gmail_api_credentials_file:
+    if opts.gmail_api_credentials_file or opts.gmail_api_service_account_file:
+        logger.info("Connecting to Gmail API...")
         if opts.mailbox_delete:
             if "https://mail.google.com/" not in opts.gmail_api_scopes:
                 logger.error(
@@ -1532,6 +1579,7 @@ def _main():
 
     if opts.maildir_path:
         try:
+            logger.info("Connecting to Maildir at %s", opts.maildir_path)
             mailbox_connection = MaildirConnection(
                 maildir_path=opts.maildir_path,
                 maildir_create=opts.maildir_create,
@@ -1542,6 +1590,7 @@ def _main():
 
     if mailbox_connection:
         try:
+            logger.info("Fetching reports from mailbox...")
             reports = get_dmarc_reports_from_mailbox(
                 connection=mailbox_connection,
                 delete=opts.mailbox_delete,
@@ -1557,6 +1606,13 @@ def _main():
                 test=opts.mailbox_test,
                 strip_attachment_payloads=opts.strip_attachment_payloads,
                 since=opts.mailbox_since,
+            )
+            
+            logger.info(
+                "Fetched %d aggregate, %d forensic, and %d SMTP TLS reports from mailbox.",
+                len(reports["aggregate_reports"]),
+                len(reports["forensic_reports"]),
+                len(reports["smtp_tls_reports"]),
             )
 
             aggregate_reports += reports["aggregate_reports"]
@@ -1579,6 +1635,7 @@ def _main():
 
     if opts.smtp_host:
         try:
+            logger.info("Emailing results to %s...", ", ".join(opts.smtp_to))
             verify = True
             if opts.smtp_skip_certificate_verification:
                 verify = False
@@ -1596,6 +1653,7 @@ def _main():
             )
         except Exception:
             logger.exception("Failed to email results")
+
             exit(1)
 
     if mailbox_connection and opts.mailbox_watch:
