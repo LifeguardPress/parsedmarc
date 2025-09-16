@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
+import logging
 from collections import OrderedDict
+import copy
 
 from elasticsearch_dsl.search import Q
 from elasticsearch_dsl import (
@@ -18,10 +20,13 @@ from elasticsearch_dsl import (
     Search,
 )
 from elasticsearch.helpers import reindex
+from elasticsearch import ElasticsearchException
 
-from parsedmarc.log import logger
 from parsedmarc.utils import human_timestamp_to_datetime
 from parsedmarc import InvalidForensicReport
+
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 
 class ElasticsearchError(Exception):
@@ -99,9 +104,8 @@ class _AggregateReportDoc(Document):
         self.spf_results.append(_SPFResult(domain=domain, scope=scope, result=result))
 
     def save(self, **kwargs):
-        self.passed_dmarc = False
         self.passed_dmarc = self.spf_aligned or self.dkim_aligned
-
+        logger.debug(f"Calculated passed_dmarc as {self.passed_dmarc} before saving document.")
         return super().save(**kwargs)
 
 
@@ -279,6 +283,7 @@ def set_hosts(
         apiKey (str): The Base64 encoded API key to use for authentication
         timeout (float): Timeout in seconds
     """
+    logger.debug("Setting Elasticsearch hosts...")
     if not isinstance(hosts, list):
         hosts = [hosts]
     conn_params = {"hosts": hosts, "timeout": timeout}
@@ -293,7 +298,21 @@ def set_hosts(
         conn_params["http_auth"] = username + ":" + password
     if apiKey:
         conn_params["api_key"] = apiKey
-    connections.create_connection(**conn_params)
+    
+    log_params = copy.deepcopy(conn_params)
+    if "http_auth" in log_params:
+        log_params["http_auth"] = "[REDACTED]"
+    if "api_key" in log_params:
+        log_params["api_key"] = "[REDACTED]"
+
+    logger.debug(f"Elasticsearch connection parameters: {log_params}")
+    logger.info(f"Connecting to Elasticsearch hosts: {hosts} with timeout {timeout}s")
+    try:
+        connections.create_connection(**conn_params)
+        logger.info("Successfully connected to Elasticsearch")
+    except ElasticsearchException as e:
+        logger.error(f"Failed to connect to Elasticsearch: {e}")
+        raise ElasticsearchError(f"Failed to connect to Elasticsearch: {e}")
 
 
 def create_indexes(names, settings=None):
@@ -305,18 +324,23 @@ def create_indexes(names, settings=None):
         settings (dict): Index settings
 
     """
+    logger.debug(f"Request to create indexes: {names}")
     for name in names:
         index = Index(name)
         try:
             if not index.exists():
-                logger.debug("Creating Elasticsearch index: {0}".format(name))
+                logger.info(f"Creating Elasticsearch index: {name} with settings: {settings}")
                 if settings is None:
                     index.settings(number_of_shards=1, number_of_replicas=0)
                 else:
                     index.settings(**settings)
                 index.create()
+                logger.info(f"Successfully created index: {name}")
+            else:
+                logger.debug(f"Index {name} already exists.")
         except Exception as e:
-            raise ElasticsearchError("Elasticsearch error: {0}".format(e.__str__()))
+            logger.error(f"Failed to create Elasticsearch index {name}: {e}")
+            raise ElasticsearchError(f"Elasticsearch error: {e}")
 
 
 def migrate_indexes(aggregate_indexes=None, forensic_indexes=None):
@@ -328,12 +352,15 @@ def migrate_indexes(aggregate_indexes=None, forensic_indexes=None):
         forensic_indexes (list): A list of forensic index names
     """
     version = 2
+    logger.info(f"Starting index migration check for schema version {version}")
     if aggregate_indexes is None:
         aggregate_indexes = []
     if forensic_indexes is None:
         forensic_indexes = []
     for aggregate_index_name in aggregate_indexes:
+        logger.debug(f"Checking aggregate index for migration: {aggregate_index_name}")
         if not Index(aggregate_index_name).exists():
+            logger.debug(f"Index {aggregate_index_name} does not exist, skipping migration.")
             continue
         aggregate_index = Index(aggregate_index_name)
         doc = "doc"
@@ -342,12 +369,17 @@ def migrate_indexes(aggregate_indexes=None, forensic_indexes=None):
         fo_mapping = aggregate_index.get_field_mapping(fields=[fo_field])
         fo_mapping = fo_mapping[list(fo_mapping.keys())[0]]["mappings"]
         if doc not in fo_mapping:
+            logger.debug(f"'{doc}' type not in mapping for {aggregate_index_name}, skipping migration for this index.")
             continue
 
         fo_mapping = fo_mapping[doc][fo_field]["mapping"][fo]
         fo_type = fo_mapping["type"]
+        logger.debug(f"Found 'published_policy.fo' field in {aggregate_index_name} with type '{fo_type}'.")
         if fo_type == "long":
-            new_index_name = "{0}-v{1}".format(aggregate_index_name, version)
+            new_index_name = f"{aggregate_index_name}-v{version}"
+            logger.info(
+                f"'published_policy.fo' field in {aggregate_index_name} is 'long', migrating to 'text'. New index: {new_index_name}"
+            )
             body = {
                 "properties": {
                     "published_policy.fo": {
@@ -356,13 +388,24 @@ def migrate_indexes(aggregate_indexes=None, forensic_indexes=None):
                     }
                 }
             }
-            Index(new_index_name).create()
-            Index(new_index_name).put_mapping(doc_type=doc, body=body)
-            reindex(connections.get_connection(), aggregate_index_name, new_index_name)
-            Index(aggregate_index_name).delete()
+            try:
+                logger.debug(f"Creating new index for migration: {new_index_name}")
+                Index(new_index_name).create()
+                Index(new_index_name).put_mapping(doc_type=doc, body=body)
+                logger.info(f"Reindexing from {aggregate_index_name} to {new_index_name}")
+                reindex(connections.get_connection(), aggregate_index_name, new_index_name)
+                logger.info(f"Deleting old index: {aggregate_index_name}")
+                Index(aggregate_index_name).delete()
+                logger.info(f"Successfully migrated {aggregate_index_name} to {new_index_name}")
+            except Exception as e:
+                logger.error(f"Failed during migration of {aggregate_index_name}: {e}")
+                raise ElasticsearchError(f"Migration failed for {aggregate_index_name}: {e}")
 
     for forensic_index in forensic_indexes:
+        logger.debug(f"Checking forensic index for migration: {forensic_index}")
+        # Placeholder for future forensic index migrations
         pass
+    logger.info("Index migration check finished.")
 
 
 def save_aggregate_report_to_elasticsearch(
@@ -387,7 +430,7 @@ def save_aggregate_report_to_elasticsearch(
     Raises:
             AlreadySaved
     """
-    logger.info("Saving aggregate report to Elasticsearch")
+    logger.info("Attempting to save aggregate report to Elasticsearch")
     aggregate_report = aggregate_report.copy()
     metadata = aggregate_report["report_metadata"]
     org_name = metadata["org_name"]
@@ -397,6 +440,11 @@ def save_aggregate_report_to_elasticsearch(
     end_date = human_timestamp_to_datetime(metadata["end_date"], to_utc=True)
     begin_date_human = begin_date.strftime("%Y-%m-%d %H:%M:%SZ")
     end_date_human = end_date.strftime("%Y-%m-%d %H:%M:%SZ")
+    logger.info(
+        f"Processing report_id: {report_id} from org: {org_name} for domain: {domain} "
+        f"with date range {begin_date_human} to {end_date_human}"
+    )
+
     if monthly_indexes:
         index_date = begin_date.strftime("%Y-%m")
     else:
@@ -412,33 +460,34 @@ def save_aggregate_report_to_elasticsearch(
     end_date_query = Q(dict(match=dict(date_end=end_date)))
 
     if index_suffix is not None:
-        search_index = "dmarc_aggregate_{0}*".format(index_suffix)
+        search_index = f"dmarc_aggregate_{index_suffix}*"
     else:
         search_index = "dmarc_aggregate*"
     if index_prefix is not None:
-        search_index = "{0}{1}".format(index_prefix, search_index)
+        search_index = f"{index_prefix}{search_index}"
     search = Search(index=search_index)
     query = org_name_query & report_id_query & domain_query
     query = query & begin_date_query & end_date_query
     search.query = query
+    logger.debug(f"Checking for existing aggregate report in {search_index} with query: {query.to_dict()}")
 
     try:
         existing = search.execute()
+        logger.debug(f"Found {len(existing)} existing aggregate documents.")
     except Exception as error_:
-        raise ElasticsearchError(
-            "Elasticsearch's search for existing report \
-            error: {}".format(error_.__str__())
-        )
+        logger.error(f"Elasticsearch search for existing aggregate report failed: {error_}")
+        raise ElasticsearchError(f"Elasticsearch search error: {error_}")
 
     if len(existing) > 0:
-        raise AlreadySaved(
-            "An aggregate report ID {0} from {1} about {2} "
-            "with a date range of {3} UTC to {4} UTC already "
-            "exists in "
-            "Elasticsearch".format(
-                report_id, org_name, domain, begin_date_human, end_date_human
-            )
+        message = (
+            f"An aggregate report ID {report_id} from {org_name} about {domain} "
+            f"with a date range of {begin_date_human} UTC to {end_date_human} UTC already "
+            "exists in Elasticsearch. Skipping."
         )
+        logger.warning(message)
+        raise AlreadySaved(message)
+    logger.info("No existing aggregate report found, proceeding to save.")
+
     published_policy = _PublishedPolicy(
         domain=aggregate_report["policy_published"]["domain"],
         adkim=aggregate_report["policy_published"]["adkim"],
@@ -449,7 +498,24 @@ def save_aggregate_report_to_elasticsearch(
         fo=aggregate_report["policy_published"]["fo"],
     )
 
-    for record in aggregate_report["records"]:
+    index = "dmarc_aggregate"
+    if index_suffix:
+        index = f"{index}_{index_suffix}"
+    if index_prefix:
+        index = f"{index_prefix}{index}"
+
+    index = f"{index}-{index_date}"
+    logger.debug(f"Target index for aggregate report: {index}")
+    index_settings = dict(
+        number_of_shards=number_of_shards, number_of_replicas=number_of_replicas
+    )
+    create_indexes([index], index_settings)
+
+    saved_records = 0
+    num_records_to_process = len(aggregate_report["records"])
+    logger.info(f"Processing {num_records_to_process} records from the aggregate report.")
+    for i, record in enumerate(aggregate_report["records"]):
+        logger.debug(f"Processing record {i+1}/{num_records_to_process}")
         agg_doc = _AggregateReportDoc(
             xml_schema=aggregate_report["xml_schema"],
             org_name=metadata["org_name"],
@@ -497,23 +563,16 @@ def save_aggregate_report_to_elasticsearch(
                 result=spf_result["result"],
             )
 
-        index = "dmarc_aggregate"
-        if index_suffix:
-            index = "{0}_{1}".format(index, index_suffix)
-        if index_prefix:
-            index = "{0}{1}".format(index_prefix, index)
-
-        index = "{0}-{1}".format(index, index_date)
-        index_settings = dict(
-            number_of_shards=number_of_shards, number_of_replicas=number_of_replicas
-        )
-        create_indexes([index], index_settings)
         agg_doc.meta.index = index
 
         try:
+            logger.debug(f"Saving aggregate document for source IP {record['source']['ip_address']}")
             agg_doc.save()
+            saved_records += 1
         except Exception as e:
-            raise ElasticsearchError("Elasticsearch error: {0}".format(e.__str__()))
+            logger.error(f"Failed to save aggregate document to Elasticsearch: {e}")
+            raise ElasticsearchError(f"Elasticsearch save error: {e}")
+    logger.info(f"Successfully saved {saved_records} records from aggregate report {report_id} to index {index}")
 
 
 def save_forensic_report_to_elasticsearch(
@@ -541,7 +600,7 @@ def save_forensic_report_to_elasticsearch(
         AlreadySaved
 
     """
-    logger.info("Saving forensic report to Elasticsearch")
+    logger.info("Attempting to save forensic report to Elasticsearch")
     forensic_report = forensic_report.copy()
     sample_date = None
     if forensic_report["parsed_sample"]["date"] is not None:
@@ -554,13 +613,14 @@ def save_forensic_report_to_elasticsearch(
 
     arrival_date = human_timestamp_to_datetime(forensic_report["arrival_date_utc"])
     arrival_date_epoch_milliseconds = int(arrival_date.timestamp() * 1000)
+    logger.info(f"Processing forensic report with arrival date: {forensic_report['arrival_date_utc']}")
 
     if index_suffix is not None:
-        search_index = "dmarc_forensic_{0}*".format(index_suffix)
+        search_index = f"dmarc_forensic_{index_suffix}*"
     else:
         search_index = "dmarc_forensic*"
     if index_prefix is not None:
-        search_index = "{0}{1}".format(index_prefix, search_index)
+        search_index = f"{index_prefix}{search_index}"
     search = Search(index=search_index)
     q = Q(dict(match=dict(arrival_date=arrival_date_epoch_milliseconds)))
 
@@ -568,46 +628,45 @@ def save_forensic_report_to_elasticsearch(
     to_ = None
     subject = None
     if "from" in headers:
-        # We convert the FROM header from a string list to a flat string.
         headers["from"] = headers["from"][0]
         if headers["from"][0] == "":
             headers["from"] = headers["from"][1]
         else:
             headers["from"] = " <".join(headers["from"]) + ">"
-
-        from_ = dict()
-        from_["sample.headers.from"] = headers["from"]
+        from_ = {"sample.headers.from": headers["from"]}
         from_query = Q(dict(match_phrase=from_))
         q = q & from_query
     if "to" in headers:
-        # We convert the TO header from a string list to a flat string.
         headers["to"] = headers["to"][0]
         if headers["to"][0] == "":
             headers["to"] = headers["to"][1]
         else:
             headers["to"] = " <".join(headers["to"]) + ">"
-
-        to_ = dict()
-        to_["sample.headers.to"] = headers["to"]
+        to_ = {"sample.headers.to": headers["to"]}
         to_query = Q(dict(match_phrase=to_))
         q = q & to_query
     if "subject" in headers:
         subject = headers["subject"]
         subject_query = {"match_phrase": {"sample.headers.subject": subject}}
         q = q & Q(subject_query)
-
+    logger.debug(f"Checking for existing forensic report in {search_index} with query: {q.to_dict()}")
     search.query = q
-    existing = search.execute()
+    try:
+        existing = search.execute()
+        logger.debug(f"Found {len(existing)} existing forensic documents.")
+    except Exception as error_:
+        logger.error(f"Elasticsearch search for existing forensic report failed: {error_}")
+        raise ElasticsearchError(f"Elasticsearch search error: {error_}")
 
     if len(existing) > 0:
-        raise AlreadySaved(
-            "A forensic sample to {0} from {1} "
-            "with a subject of {2} and arrival date of {3} "
-            "already exists in "
-            "Elasticsearch".format(
-                to_, from_, subject, forensic_report["arrival_date_utc"]
-            )
+        message = (
+            f"A forensic sample to {to_} from {from_} "
+            f"with a subject of '{subject}' and arrival date of {forensic_report['arrival_date_utc']} "
+            "already exists in Elasticsearch. Skipping."
         )
+        logger.warning(message)
+        raise AlreadySaved(message)
+    logger.info("No existing forensic report found, proceeding to save.")
 
     parsed_sample = forensic_report["parsed_sample"]
     sample = _ForensicSampleDoc(
@@ -660,27 +719,30 @@ def save_forensic_report_to_elasticsearch(
 
         index = "dmarc_forensic"
         if index_suffix:
-            index = "{0}_{1}".format(index, index_suffix)
+            index = f"{index}_{index_suffix}"
         if index_prefix:
-            index = "{0}{1}".format(index_prefix, index)
+            index = f"{index_prefix}{index}"
         if monthly_indexes:
             index_date = arrival_date.strftime("%Y-%m")
         else:
             index_date = arrival_date.strftime("%Y-%m-%d")
-        index = "{0}-{1}".format(index, index_date)
+        index = f"{index}-{index_date}"
+        logger.debug(f"Target index for forensic report: {index}")
         index_settings = dict(
             number_of_shards=number_of_shards, number_of_replicas=number_of_replicas
         )
         create_indexes([index], index_settings)
         forensic_doc.meta.index = index
         try:
+            logger.debug(f"Saving forensic document for subject '{subject}'")
             forensic_doc.save()
+            logger.info(f"Successfully saved forensic report to index {index}")
         except Exception as e:
-            raise ElasticsearchError("Elasticsearch error: {0}".format(e.__str__()))
+            logger.error(f"Failed to save forensic document to Elasticsearch: {e}")
+            raise ElasticsearchError(f"Elasticsearch save error: {e}")
     except KeyError as e:
-        raise InvalidForensicReport(
-            "Forensic report missing required field: {0}".format(e.__str__())
-        )
+        logger.error(f"Forensic report is missing a required field: {e}")
+        raise InvalidForensicReport(f"Forensic report missing required field: {e}")
 
 
 def save_smtp_tls_report_to_elasticsearch(
@@ -705,13 +767,14 @@ def save_smtp_tls_report_to_elasticsearch(
     Raises:
             AlreadySaved
     """
-    logger.info("Saving smtp tls report to Elasticsearch")
+    logger.info("Attempting to save SMTP TLS report to Elasticsearch")
     org_name = report["organization_name"]
     report_id = report["report_id"]
     begin_date = human_timestamp_to_datetime(report["begin_date"], to_utc=True)
     end_date = human_timestamp_to_datetime(report["end_date"], to_utc=True)
     begin_date_human = begin_date.strftime("%Y-%m-%d %H:%M:%SZ")
     end_date_human = end_date.strftime("%Y-%m-%d %H:%M:%SZ")
+    logger.info(f"Processing SMTP TLS report_id: {report_id} from {org_name} for date range {begin_date_human} to {end_date_human}")
     if monthly_indexes:
         index_date = begin_date.strftime("%Y-%m")
     else:
@@ -725,39 +788,43 @@ def save_smtp_tls_report_to_elasticsearch(
     end_date_query = Q(dict(match=dict(date_end=end_date)))
 
     if index_suffix is not None:
-        search_index = "smtp_tls_{0}*".format(index_suffix)
+        search_index = f"smtp_tls_{index_suffix}*"
     else:
         search_index = "smtp_tls*"
     if index_prefix is not None:
-        search_index = "{0}{1}".format(index_prefix, search_index)
+        search_index = f"{index_prefix}{search_index}"
     search = Search(index=search_index)
     query = org_name_query & report_id_query
     query = query & begin_date_query & end_date_query
     search.query = query
+    logger.debug(f"Checking for existing SMTP TLS report in {search_index} with query: {query.to_dict()}")
 
     try:
         existing = search.execute()
+        logger.debug(f"Found {len(existing)} existing SMTP TLS documents.")
     except Exception as error_:
-        raise ElasticsearchError(
-            "Elasticsearch's search for existing report \
-            error: {}".format(error_.__str__())
-        )
+        logger.error(f"Elasticsearch search for existing SMTP TLS report failed: {error_}")
+        raise ElasticsearchError(f"Elasticsearch search error: {error_}")
 
     if len(existing) > 0:
-        raise AlreadySaved(
+        message = (
             f"An SMTP TLS report ID {report_id} from "
             f" {org_name} with a date range of "
             f"{begin_date_human} UTC to "
             f"{end_date_human} UTC already "
-            "exists in Elasticsearch"
+            "exists in Elasticsearch. Skipping."
         )
+        logger.warning(message)
+        raise AlreadySaved(message)
+    logger.info("No existing SMTP TLS report found, proceeding to save.")
 
     index = "smtp_tls"
     if index_suffix:
-        index = "{0}_{1}".format(index, index_suffix)
+        index = f"{index}_{index_suffix}"
     if index_prefix:
-        index = "{0}{1}".format(index_prefix, index)
-    index = "{0}-{1}".format(index, index_date)
+        index = f"{index_prefix}{index}"
+    index = f"{index}-{index_date}"
+    logger.debug(f"Target index for SMTP TLS report: {index}")
     index_settings = dict(
         number_of_shards=number_of_shards, number_of_replicas=number_of_replicas
     )
@@ -771,6 +838,7 @@ def save_smtp_tls_report_to_elasticsearch(
         report_id=report["report_id"],
     )
 
+    logger.debug(f"Processing {len(report['policies'])} policies in the SMTP TLS report.")
     for policy in report["policies"]:
         policy_strings = None
         mx_host_patterns = None
@@ -787,6 +855,7 @@ def save_smtp_tls_report_to_elasticsearch(
             mx_host_patterns=mx_host_patterns,
         )
         if "failure_details" in policy:
+            logger.debug(f"Processing {len(policy['failure_details'])} failure details for policy domain {policy['policy_domain']}.")
             for failure_detail in policy["failure_details"]:
                 receiving_mx_hostname = None
                 additional_information_uri = None
@@ -829,6 +898,9 @@ def save_smtp_tls_report_to_elasticsearch(
     smtp_tls_doc.meta.index = index
 
     try:
+        logger.debug(f"Saving SMTP TLS document for report ID {report_id}")
         smtp_tls_doc.save()
+        logger.info(f"Successfully saved SMTP TLS report {report_id} to index {index}")
     except Exception as e:
-        raise ElasticsearchError("Elasticsearch error: {0}".format(e.__str__()))
+        logger.error(f"Failed to save SMTP TLS document to Elasticsearch: {e}")
+        raise ElasticsearchError(f"Elasticsearch save error: {e}")
