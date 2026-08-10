@@ -12,6 +12,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from parsedmarc.mail.mailbox_connection import MailboxConnection
+
 # Use a standard logger. If this module is part of a larger package,
 # it's better to get the logger from that package (e.g., from parsedmarc.log import logger)
 logger = logging.getLogger(__name__)
