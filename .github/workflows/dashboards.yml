@@ -22,7 +22,7 @@ on:
 jobs:
   kibana-import:
     name: Verify ndjson imports into Kibana 8.x
-    runs-on: arc-runner-set-01
+    runs-on: gke-arc-runner-set-01
 
     services:
       elasticsearch:

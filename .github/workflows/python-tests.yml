@@ -11,7 +11,7 @@ on:
 
 jobs:
   lint-docs-build:
-    runs-on: arc-runner-set-01
+    runs-on: gke-arc-runner-set-01
 
     steps:
     - uses: actions/checkout@v5
@@ -42,7 +42,7 @@ jobs:
 
   test:
     needs: lint-docs-build
-    runs-on: arc-runner-set-01
+    runs-on: gke-arc-runner-set-01
 
     services:
       elasticsearch:
