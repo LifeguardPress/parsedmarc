@@ -63,3 +63,49 @@ jobs:
           push: true
           tags:  ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    name: Deploy parsedmarc with Skaffold
+    needs: build-and-push-image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: gke-arc-runner-set-01
+    permissions:
+      contents: read
+
+    env:
+      GCP_PROJECT_ID: prod-datacenter-489417
+      GKE_CLUSTER: lgp-cluster-1
+      GKE_LOCATION: us-central1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          version: latest
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Configure GKE credentials
+        run: |
+          gcloud config set project "$GCP_PROJECT_ID"
+          gcloud auth list
+          gcloud container clusters get-credentials "$GKE_CLUSTER" \
+            --region "$GKE_LOCATION" \
+            --project "$GCP_PROJECT_ID"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install Skaffold
+        run: |
+          curl --fail --silent --show-error --location \
+            -o "$RUNNER_TEMP/skaffold" \
+            https://storage.googleapis.com/skaffold/releases/latest/skaffold-linux-amd64
+          chmod 0755 "$RUNNER_TEMP/skaffold"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/skaffold" version
+
+      - name: Deploy parsedmarc
+        run: skaffold run --profile prod --status-check=true

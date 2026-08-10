@@ -1,0 +1,18 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: parsedmarc
+
+profiles:
+  - name: prod
+    deploy:
+      helm:
+        releases:
+          - name: parsedmarc
+            chartPath: charts/parsedmarc
+            namespace: dmarc
+            createNamespace: true
+            setValues:
+              image.repository: ghcr.io/lifeguardpress/parsedmarc
+              image.tag: master
+              image.pullPolicy: Always
