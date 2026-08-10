@@ -7,6 +7,13 @@
    :members:
 ```
 
+## parsedmarc.config
+
+```{eval-rst}
+.. automodule:: parsedmarc.config
+   :members:
+```
+
 ## parsedmarc.elastic
 
 ```{eval-rst}
@@ -25,6 +32,13 @@
 
 ```{eval-rst}
 .. automodule:: parsedmarc.splunk
+   :members:
+```
+
+## parsedmarc.types
+
+```{eval-rst}
+.. automodule:: parsedmarc.types
    :members:
 ```
 

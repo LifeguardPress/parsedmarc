@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch:*)",
+      "Bash(ruff check:*)",
+      "Bash(ruff format:*)",
+      "Bash(ls tests*)",
+      "Bash(pytest *)",
+      "Bash(.venv/bin/pytest *)",
+      "Bash(GITHUB_ACTIONS=true pytest *)",
+      "Bash(GITHUB_ACTIONS=true .venv/bin/pytest *)",
+      "Bash(.venv/bin/pyright *)",
+      "Bash(.venv/bin/python -m ruff check .)",
+      "Bash(.venv/bin/python -m ruff format --check .)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

@@ -1,15 +1,28 @@
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import json
-from ssl import create_default_context
+from ssl import SSLContext, create_default_context
+from typing import TYPE_CHECKING, Any
 
 from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable, UnknownTopicOrPartitionError
-from collections import OrderedDict
-from parsedmarc.utils import human_timestamp_to_datetime
+from kafka.errors import UnknownTopicOrPartitionError
+
+if TYPE_CHECKING:
+    from kafka.errors import KafkaTimeoutError as _BootstrapError
+else:
+    try:
+        # kafka-python < 3.0 raises this when the producer cannot bootstrap
+        from kafka.errors import NoBrokersAvailable as _BootstrapError
+    except ImportError:
+        # kafka-python >= 3.0 removed NoBrokersAvailable; a failed bootstrap
+        # raises KafkaTimeoutError instead
+        from kafka.errors import KafkaTimeoutError as _BootstrapError
 
 from parsedmarc import __version__
 from parsedmarc.log import logger
+from parsedmarc.utils import human_timestamp_to_datetime
 
 
 class KafkaError(RuntimeError):
@@ -18,7 +31,13 @@ class KafkaError(RuntimeError):
 
 class KafkaClient(object):
     def __init__(
-        self, kafka_hosts, ssl=False, username=None, password=None, ssl_context=None
+        self,
+        kafka_hosts: list[str],
+        *,
+        ssl: bool | None = False,
+        username: str | None = None,
+        password: str | None = None,
+        ssl_context: SSLContext | None = None,
     ):
         """
         Initializes the Kafka client
@@ -28,7 +47,7 @@ class KafkaClient(object):
             ssl (bool): Use a SSL/TLS connection
             username (str): An optional username
             password (str):  An optional password
-            ssl_context: SSL context options
+            ssl_context (SSLContext): SSL context options
 
         Notes:
             ``use_ssl=True`` is implied when a username or password are
@@ -38,10 +57,10 @@ class KafkaClient(object):
             ``$ConnectionString``, and the password is the
             Azure Event Hub connection string.
         """
-        config = dict(
+        config: dict[str, Any] = dict(
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
             bootstrap_servers=kafka_hosts,
-            client_id="parsedmarc-{0}".format(__version__),
+            client_id=f"parsedmarc-{__version__}",
         )
         if ssl or username or password:
             config["security_protocol"] = "SSL"
@@ -51,11 +70,15 @@ class KafkaClient(object):
                 config["sasl_plain_password"] = password or ""
         try:
             self.producer = KafkaProducer(**config)
-        except NoBrokersAvailable:
+        except _BootstrapError:
             raise KafkaError("No Kafka brokers available")
 
+    def close(self):
+        """Close the Kafka producer, releasing background threads and sockets."""
+        self.producer.close()
+
     @staticmethod
-    def strip_metadata(report):
+    def strip_metadata(report: dict[str, Any]):
         """
         Duplicates org_name, org_email and report_id into JSON root
         and removes report_metadata key to bring it more inline
@@ -69,7 +92,7 @@ class KafkaClient(object):
         return report
 
     @staticmethod
-    def generate_daterange(report):
+    def generate_date_range(report: dict[str, Any]):
         """
         Creates a date_range timestamp with format YYYY-MM-DD-T-HH:MM:SS
         based on begin and end dates for easier parsing in Kibana.
@@ -83,10 +106,14 @@ class KafkaClient(object):
         begin_date_human = begin_date.strftime("%Y-%m-%dT%H:%M:%S")
         end_date_human = end_date.strftime("%Y-%m-%dT%H:%M:%S")
         date_range = [begin_date_human, end_date_human]
-        logger.debug("date_range is {}".format(date_range))
+        logger.debug(f"date_range is {date_range}")
         return date_range
 
-    def save_aggregate_reports_to_kafka(self, aggregate_reports, aggregate_topic):
+    def save_aggregate_reports_to_kafka(
+        self,
+        aggregate_reports: dict[str, Any] | list[dict[str, Any]],
+        aggregate_topic: str,
+    ):
         """
         Saves aggregate DMARC reports to Kafka
 
@@ -96,16 +123,14 @@ class KafkaClient(object):
             aggregate_topic (str): The name of the Kafka topic
 
         """
-        if isinstance(aggregate_reports, dict) or isinstance(
-            aggregate_reports, OrderedDict
-        ):
+        if isinstance(aggregate_reports, dict):
             aggregate_reports = [aggregate_reports]
 
         if len(aggregate_reports) < 1:
             return
 
         for report in aggregate_reports:
-            report["date_range"] = self.generate_daterange(report)
+            report["date_range"] = self.generate_date_range(report)
             report = self.strip_metadata(report)
 
             for slice in report["records"]:
@@ -123,50 +148,61 @@ class KafkaClient(object):
                         "Kafka error: Unknown topic or partition on broker"
                     )
                 except Exception as e:
-                    raise KafkaError("Kafka error: {0}".format(e.__str__()))
+                    raise KafkaError(f"Kafka error: {e.__str__()}")
                 try:
                     self.producer.flush()
                 except Exception as e:
-                    raise KafkaError("Kafka error: {0}".format(e.__str__()))
+                    raise KafkaError(f"Kafka error: {e.__str__()}")
 
-    def save_forensic_reports_to_kafka(self, forensic_reports, forensic_topic):
+    def save_failure_reports_to_kafka(
+        self,
+        failure_reports: dict[str, Any] | list[dict[str, Any]],
+        failure_topic: str,
+    ):
         """
-        Saves forensic DMARC reports to Kafka, sends individual
+        Saves failure DMARC reports to Kafka, sends individual
         records (slices) since Kafka requires messages to be <= 1MB
         by default.
 
         Args:
-            forensic_reports (list):  A list of forensic report dicts
+            failure_reports (list):  A list of failure report dicts
             to save to Kafka
-            forensic_topic (str): The name of the Kafka topic
+            failure_topic (str): The name of the Kafka topic
 
         """
-        if isinstance(forensic_reports, dict):
-            forensic_reports = [forensic_reports]
+        if isinstance(failure_reports, dict):
+            failure_reports = [failure_reports]
 
-        if len(forensic_reports) < 1:
+        if len(failure_reports) < 1:
             return
 
         try:
-            logger.debug("Saving forensic reports to Kafka")
-            self.producer.send(forensic_topic, forensic_reports)
+            logger.debug("Saving failure reports to Kafka")
+            self.producer.send(failure_topic, failure_reports)
         except UnknownTopicOrPartitionError:
             raise KafkaError("Kafka error: Unknown topic or partition on broker")
         except Exception as e:
-            raise KafkaError("Kafka error: {0}".format(e.__str__()))
+            raise KafkaError(f"Kafka error: {e.__str__()}")
         try:
             self.producer.flush()
         except Exception as e:
-            raise KafkaError("Kafka error: {0}".format(e.__str__()))
+            raise KafkaError(f"Kafka error: {e.__str__()}")
 
-    def save_smtp_tls_reports_to_kafka(self, smtp_tls_reports, smtp_tls_topic):
+    # Backward-compatible alias
+    save_forensic_reports_to_kafka = save_failure_reports_to_kafka
+
+    def save_smtp_tls_reports_to_kafka(
+        self,
+        smtp_tls_reports: list[dict[str, Any]] | dict[str, Any],
+        smtp_tls_topic: str,
+    ):
         """
         Saves SMTP TLS reports to Kafka, sends individual
         records (slices) since Kafka requires messages to be <= 1MB
         by default.
 
         Args:
-            smtp_tls_reports (list):  A list of forensic report dicts
+            smtp_tls_reports (list):  A list of SMTP TLS report dicts
             to save to Kafka
             smtp_tls_topic (str): The name of the Kafka topic
 
@@ -178,13 +214,13 @@ class KafkaClient(object):
             return
 
         try:
-            logger.debug("Saving forensic reports to Kafka")
+            logger.debug("Saving SMTP TLS reports to Kafka")
             self.producer.send(smtp_tls_topic, smtp_tls_reports)
         except UnknownTopicOrPartitionError:
             raise KafkaError("Kafka error: Unknown topic or partition on broker")
         except Exception as e:
-            raise KafkaError("Kafka error: {0}".format(e.__str__()))
+            raise KafkaError(f"Kafka error: {e.__str__()}")
         try:
             self.producer.flush()
         except Exception as e:
-            raise KafkaError("Kafka error: {0}".format(e.__str__()))
+            raise KafkaError(f"Kafka error: {e.__str__()}")

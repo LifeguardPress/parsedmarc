@@ -4,8 +4,91 @@ from __future__ import annotations
 
 import os
 import csv
+import re
 from pathlib import Path
-from typing import Mapping, Iterable, Optional, Collection, Union, List, Dict
+from collections.abc import Mapping, Iterable, Collection
+
+
+_TYPES_LIST_RE = re.compile(
+    r"<!--\s*types-list:start\s*-->(.*?)<!--\s*types-list:end\s*-->",
+    re.DOTALL,
+)
+
+
+def _parse_types_block(block: str, source: str) -> list[str]:
+    """Extract type names from the raw text between the marker comments."""
+    types: list[str] = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("- "):
+            raise ValueError(
+                f"{source}: unexpected line inside types-list block: {line!r}"
+            )
+        types.append(stripped[2:].strip())
+    return types
+
+
+def normalize_types_in_readme(readme_path: str | Path) -> list[str]:
+    """Validate, normalize, and load the authoritative `type` list from README.md.
+
+    Trims leading/trailing whitespace from each item, deduplicates
+    case-insensitively (preserving first-seen casing), and sorts the list
+    case-insensitively. If the on-disk list differs from the normalized
+    form, the README is rewritten in place. Returns the normalized list.
+
+    Raises ValueError if the markers are missing, the block is empty, a
+    line doesn't start with `- `, or two entries differ only by casing.
+    """
+    path = Path(readme_path)
+    text = path.read_text(encoding="utf-8")
+    m = _TYPES_LIST_RE.search(text)
+    if not m:
+        raise ValueError(
+            f"{path}: missing <!-- types-list:start --> / <!-- types-list:end --> markers"
+        )
+    raw_types = _parse_types_block(m.group(1), str(path))
+    if not raw_types:
+        raise ValueError(f"{path}: types-list block is empty")
+
+    seen: dict[str, str] = {}
+    for t in raw_types:
+        key = t.lower()
+        if key in seen and seen[key] != t:
+            raise ValueError(
+                f"{path}: types-list contains case-conflicting entries: "
+                f"{seen[key]!r} and {t!r}"
+            )
+        seen.setdefault(key, t)
+    normalized = sorted(seen.values(), key=str.lower)
+
+    if normalized != raw_types:
+        new_block = "\n".join(f"- {t}" for t in normalized)
+        replacement = f"<!-- types-list:start -->\n{new_block}\n<!-- types-list:end -->"
+        new_text = text[: m.start()] + replacement + text[m.end() :]
+        path.write_text(new_text, encoding="utf-8")
+    return normalized
+
+
+def load_types_from_readme(readme_path: str | Path) -> list[str]:
+    """Read the authoritative `type` list out of README.md without rewriting.
+
+    Use `normalize_types_in_readme` to additionally sort, dedupe, and
+    rewrite the block in place. This thin wrapper is kept for callers
+    that only want to read the list (e.g. tests, downstream tools).
+    """
+    path = Path(readme_path)
+    text = path.read_text(encoding="utf-8")
+    m = _TYPES_LIST_RE.search(text)
+    if not m:
+        raise ValueError(
+            f"{path}: missing <!-- types-list:start --> / <!-- types-list:end --> markers"
+        )
+    types = _parse_types_block(m.group(1), str(path))
+    if not types:
+        raise ValueError(f"{path}: types-list block is empty")
+    return types
 
 
 class CSVValidationError(Exception):
@@ -15,16 +98,16 @@ class CSVValidationError(Exception):
 
 
 def sort_csv(
-    filepath: Union[str, Path],
+    filepath: str | Path,
     field: str,
     *,
     sort_field_value_must_be_unique: bool = True,
     strip_whitespace: bool = True,
-    fields_to_lowercase: Optional[Iterable[str]] = None,
+    fields_to_lowercase: Iterable[str] | None = None,
     case_insensitive_sort: bool = False,
-    required_fields: Optional[Iterable[str]] = None,
-    allowed_values: Optional[Mapping[str, Collection[str]]] = None,
-) -> List[Dict[str, str]]:
+    required_fields: Iterable[str] | None = None,
+    allowed_values: Mapping[str, Collection[str]] | None = None,
+) -> None:
     """
     Read a CSV, optionally normalize rows (strip whitespace, lowercase certain fields),
     validate field values, and write the sorted CSV back to the same path.
@@ -41,8 +124,7 @@ def sort_csv(
     required_fields = set(required_fields or [])
     lower_set = set(fields_to_lowercase or [])
     allowed_sets = {k: set(v) for k, v in (allowed_values or {}).items()}
-    if sort_field_value_must_be_unique:
-        seen_sort_field_values = []
+    seen_sort_field_values: list[str] = []
 
     with path.open("r", newline="") as infile:
         reader = csv.DictReader(infile)
@@ -56,7 +138,7 @@ def sort_csv(
             )
         rows = list(reader)
 
-    def normalize_row(row: Dict[str, str]) -> None:
+    def normalize_row(row: dict[str, str]) -> None:
         if strip_whitespace:
             for k, v in row.items():
                 if isinstance(v, str):
@@ -66,7 +148,7 @@ def sort_csv(
                 row[fld] = row[fld].lower()
 
     def validate_row(
-        row: Dict[str, str], sort_field: str, line_no: int, errors: list[str]
+        row: dict[str, str], sort_field: str, line_no: int, errors: list[str]
     ) -> None:
         if sort_field_value_must_be_unique:
             if row[sort_field] in seen_sort_field_values:
@@ -96,7 +178,7 @@ def sort_csv(
     if errors:
         raise CSVValidationError(errors)
 
-    def sort_key(r: Dict[str, str]):
+    def sort_key(r: dict[str, str]):
         v = r.get(field, "")
         if isinstance(v, str) and case_insensitive_sort:
             return v.casefold()
@@ -111,14 +193,14 @@ def sort_csv(
 
 
 def sort_list_file(
-    filepath: Union[str, Path],
+    filepath: str | Path,
     *,
     lowercase: bool = True,
     strip: bool = True,
     deduplicate: bool = True,
     remove_blank_lines: bool = True,
     ending_newline: bool = True,
-    newline: Optional[str] = "\n",
+    newline: str | None = "\n",
 ):
     """Read a list from a file, sort it, optionally strip and deduplicate the values,
     then write that list back to the file.
@@ -153,29 +235,34 @@ def _main():
     map_file = "base_reverse_dns_map.csv"
     map_key = "base_reverse_dns"
     list_files = ["known_unknown_base_reverse_dns.txt", "psl_overrides.txt"]
-    types_file = "base_reverse_dns_types.txt"
+    readme_file = "README.md"
 
-    with open(types_file) as f:
-        types = f.readlines()
-        while "" in types:
-            types.remove("")
+    if not os.path.exists(readme_file):
+        print(f"Error: {readme_file} does not exist")
+        exit(1)
+    try:
+        types = normalize_types_in_readme(readme_file)
+    except ValueError as e:
+        print(f"Error: {e}")
+        exit(1)
 
-    map_allowed_values = {"Type": types}
+    map_allowed_values = {"type": types}
 
     for list_file in list_files:
         if not os.path.exists(list_file):
             print(f"Error: {list_file} does not exist")
             exit(1)
         sort_list_file(list_file)
-    if not os.path.exists(types_file):
-        print(f"Error: {types_file} does not exist")
-        exit(1)
-    sort_list_file(types_file, lowercase=False)
     if not os.path.exists(map_file):
         print(f"Error: {map_file} does not exist")
         exit(1)
     try:
-        sort_csv(map_file, map_key, allowed_values=map_allowed_values)
+        sort_csv(
+            map_file,
+            map_key,
+            case_insensitive_sort=True,
+            allowed_values=map_allowed_values,
+        )
     except CSVValidationError as e:
         print(f"{map_file} did not validate: {e}")
 

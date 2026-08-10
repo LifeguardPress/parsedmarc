@@ -3,53 +3,78 @@
 
 """A CLI for parsing DMARC reports"""
 
-from argparse import Namespace, ArgumentParser
-import os
-from configparser import ConfigParser
-from glob import glob
-import logging
-import math
-from collections import OrderedDict
-import json
-from ssl import CERT_NONE, create_default_context
-from multiprocessing import Pipe, Process
-import sys
+import atexit
+import functools
 import http.client
+import json
+import logging
+import os
+import shutil
+import signal
+import sys
+import time
+from argparse import ArgumentParser, Namespace
+from configparser import ConfigParser
+from glob import escape as glob_escape, glob
+from ssl import CERT_NONE, create_default_context
+
+import httpx
+import yaml
+from azure.core.exceptions import ClientAuthenticationError
+from kiota_abstractions.api_error import APIError
 from tqdm import tqdm
 
 from parsedmarc import (
-    get_dmarc_reports_from_mailbox,
-    watch_inbox,
-    parse_report_file,
-    get_dmarc_reports_from_mbox,
-    elastic,
-    opensearch,
-    kafkaclient,
-    splunk,
-    save_output,
-    email_results,
+    IP_ADDRESS_CACHE,
+    REVERSE_DNS_MAP,
+    SEEN_AGGREGATE_REPORT_IDS,
+    InvalidDMARCReport,
+    ParserConfig,
     ParserError,
     __version__,
-    InvalidDMARCReport,
-    s3,
-    syslog,
-    loganalytics,
+    elastic,
+    email_results,
+    email_results_via_msgraph,
     gelf,
+    get_dmarc_reports_from_mailbox,
+    get_dmarc_reports_from_mbox,
+    kafkaclient,
+    loganalytics,
+    opensearch,
+    postgres,
+    s3,
+    save_output,
+    splunk,
+    syslog,
+    watch_inbox,
     webhook,
 )
-from parsedmarc.mail import (
-    IMAPConnection,
-    MSGraphConnection,
-    GmailConnection,
-    MaildirConnection,
-)
-from parsedmarc.mail.graph import AuthMethod
-
+from parsedmarc.constants import DEFAULT_DNS_MAX_RETRIES, DEFAULT_DNS_TIMEOUT
 from parsedmarc.log import logger
-from parsedmarc.utils import is_mbox, get_reverse_dns
-from parsedmarc import SEEN_AGGREGATE_REPORT_IDS
+from parsedmarc.mail import (
+    AuthMethod,
+    GmailConnection,
+    IMAPConnection,
+    MaildirConnection,
+    MSGraphConnection,
+)
+from parsedmarc.parallel import _parse_report_file_job, parallel_map
+from parsedmarc.types import ParsedReport, ParsingResults
+from parsedmarc.utils import (
+    InvalidIPinfoAPIKey,
+    configure_ipinfo_api,
+    get_base_domain,
+    get_reverse_dns,
+    human_timestamp_to_datetime,
+    is_mbox,
+    load_ip_db,
+    load_psl_overrides,
+    load_reverse_dns_map,
+)
 
-http.client._MAXHEADERS = 200  # pylint:disable=protected-access
+# Increase the max header limit for very large emails. `_MAXHEADERS` is a
+# private stdlib attribute and may not exist in type stubs.
+setattr(http.client, "_MAXHEADERS", 200)
 
 formatter = logging.Formatter(
     fmt="%(levelname)8s:%(filename)s:%(lineno)d:%(message)s",
@@ -60,73 +85,1926 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 
+class ConfigurationError(Exception):
+    """Raised when a configuration file has missing or invalid settings."""
+
+    pass
+
+
+def _normalize_graph_auth_method(value: str) -> str:
+    """Return the canonical :class:`AuthMethod` member name for *value*.
+
+    Matching is case-insensitive so config values like ``certificate`` are
+    accepted alongside the canonical ``Certificate``.
+
+    Raises:
+        ConfigurationError: When *value* does not match a known auth method.
+    """
+    value_lower = value.lower()
+    for method in AuthMethod:
+        if method.name.lower() == value_lower:
+            return method.name
+    raise ConfigurationError(
+        "Invalid msgraph auth_method: {!r}. Valid values are: {}".format(
+            value, ", ".join(m.name for m in AuthMethod)
+        )
+    )
+
+
 def _str_to_list(s):
     """Converts a comma separated string to a list"""
     _list = s.split(",")
     return list(map(lambda i: i.lstrip(), _list))
 
 
-def cli_parse(
-    file_path,
-    sa,
-    nameservers,
-    dns_timeout,
-    ip_db_path,
-    offline,
-    always_use_local_files,
-    reverse_dns_map_path,
-    reverse_dns_map_url,
-    conn,
-):
-    """Separated this function for multiprocessing"""
+def _msgraph_request_id_suffix(error: Exception) -> str:
+    """Returns ``" (request-id=..., client-request-id=...)"`` with only
+    the ids that are actually present, or ``""`` if neither is
+    available. Never raises."""
     try:
-        file_results = parse_report_file(
-            file_path,
-            ip_db_path=ip_db_path,
-            offline=offline,
-            always_use_local_files=always_use_local_files,
-            reverse_dns_map_path=reverse_dns_map_path,
-            reverse_dns_map_url=reverse_dns_map_url,
-            nameservers=nameservers,
-            dns_timeout=dns_timeout,
-            strip_attachment_payloads=sa,
+        inner_error = getattr(getattr(error, "error", None), "inner_error", None)
+        request_id = getattr(inner_error, "request_id", None)
+        client_request_id = getattr(inner_error, "client_request_id", None)
+        if not request_id:
+            headers = getattr(error, "response_headers", None) or {}
+            request_id = headers.get("request-id")
+        parts = []
+        if request_id:
+            parts.append(f"request-id={request_id}")
+        if client_request_id:
+            parts.append(f"client-request-id={client_request_id}")
+        if not parts:
+            return ""
+        return " ({})".format(", ".join(parts))
+    except Exception:
+        return ""
+
+
+def _log_msgraph_failure(
+    error: Exception,
+    *,
+    stage: str,
+    mailbox: str | None,
+    tenant_id: str | None,
+    auth_method: str | None,
+) -> None:
+    """Logs a single clear ERROR line for a Microsoft Graph connection,
+    fetch, send, or watch failure, identifying the mailbox/tenant/auth
+    method and the Graph request-id/client-request-id when available.
+    The full traceback is preserved at --debug via a follow-up DEBUG
+    record. Never calls exit() - the call site keeps its own exit(1)."""
+    if isinstance(error, APIError):
+        detail = getattr(error, "primary_message", None) or error.message or str(error)
+        detail = " ".join(str(detail).split())
+        summary = (
+            f"{type(error).__name__} status={error.response_status_code}: {detail}"
         )
-        conn.send([file_results, file_path])
-    except ParserError as error:
-        conn.send([error, file_path])
-    finally:
-        conn.close()
+    else:
+        summary = "{}: {}".format(type(error).__name__, " ".join(str(error).split()))
+
+    logger.error(
+        "Microsoft Graph %s failed (mailbox=%s, tenant_id=%s, auth_method=%s): %s%s",
+        stage,
+        mailbox,
+        tenant_id,
+        auth_method,
+        summary,
+        _msgraph_request_id_suffix(error),
+    )
+    logger.debug("Microsoft Graph %s failure details:", stage, exc_info=True)
+
+
+def _expand_path(p: str) -> str:
+    """Expand ``~`` and ``$VAR`` references in a file path."""
+    return os.path.expanduser(os.path.expandvars(p))
+
+
+def _expand_file_path_args(paths: list[str], recursive: bool = False) -> list[str]:
+    """Expand CLI file-path arguments into a flat list of file paths.
+
+    A path to an existing file is taken literally, a path to an existing
+    directory is expanded to the files inside it (see below), and only a
+    non-existent path is treated as a glob pattern. This preserves
+    shell-style wildcard expansion (e.g. a quoted ``samples/*.xml``) while
+    ensuring that literal filenames containing glob metacharacters
+    (``[``, ``]``, ``*``, ``?``) are not silently dropped. Emailed DMARC
+    failure reports are frequently named like
+    ``[Provider DMARC Failure Report] Subject.eml``; ``glob()`` treats the
+    brackets as a character class, matches nothing, and drops the file
+    (see <https://docs.python.org/3/library/glob.html>).
+
+    A directory is expanded to the files directly inside it, using the
+    same shell-glob semantics as ``<dir>/*`` (or ``<dir>/**`` when
+    ``recursive`` is ``True``): dotfile entries are excluded, and
+    non-file entries (subdirectories) are filtered out. With
+    ``recursive=False`` a subdirectory found this way is skipped with a
+    debug log rather than descended into. The directory component is
+    passed through ``glob.escape`` before being combined with the
+    wildcard so that directory names containing glob metacharacters
+    (``[``, ``]``, ``*``, ``?``) still expand correctly instead of being
+    treated as a character class or wildcard themselves.
+
+    ``recursive`` also enables ``**`` to match any number of directories
+    (including none) in glob patterns supplied directly as arguments, per
+    the same stdlib glob semantics.
+    """
+    expanded: list[str] = []
+    for path in paths:
+        if os.path.isdir(path):
+            pattern = os.path.join(glob_escape(path), "**" if recursive else "*")
+            for match in sorted(glob(pattern, recursive=recursive)):
+                if os.path.isfile(match):
+                    expanded.append(match)
+                elif not recursive and os.path.isdir(match):
+                    logger.debug(
+                        "Skipping subdirectory %s (pass --recursive to descend)",
+                        match,
+                    )
+        elif os.path.exists(path):
+            expanded.append(path)
+        else:
+            expanded += glob(path, recursive=recursive)
+    return expanded
+
+
+def _exclude_archived_paths(file_paths: list[str], archive_directory: str) -> list[str]:
+    """Filter *file_paths* down to paths that are not already inside
+    *archive_directory*.
+
+    The archive directory may live inside an input directory (e.g.
+    ``<input>/archive``), so without this filter a file already moved
+    into the archive on a previous run would be picked up again by a
+    later ``file_path`` directory expansion, re-parsed, and re-archived
+    (colliding with itself and accumulating numeric suffixes forever).
+
+    Paths are resolved with ``os.path.realpath`` (not just
+    ``os.path.abspath``) so a symlinked spelling of either the archive
+    directory or an input path still matches: e.g. ``archive_directory``
+    configured via a ``/data`` symlink while the input directory is
+    passed as the real ``/mnt/...`` path would otherwise never compare
+    equal, and every run would re-archive the same files with a new
+    numeric suffix forever.
+    """
+    archive_root = os.path.normcase(os.path.realpath(archive_directory))
+    kept: list[str] = []
+    for path in file_paths:
+        abs_path = os.path.normcase(os.path.realpath(path))
+        try:
+            inside_archive = (
+                os.path.commonpath([archive_root, abs_path]) == archive_root
+            )
+        except ValueError:
+            # Paths are on different drives (Windows) or otherwise not
+            # comparable, so the path can't be inside the archive.
+            inside_archive = False
+        if inside_archive:
+            logger.debug(f"Excluding already-archived file {path}")
+            continue
+        kept.append(path)
+    return kept
+
+
+def _archive_subdir_for_result(result: ParsedReport) -> str | None:
+    """Return the ``<year>/<month>/<type folder>`` subdirectory a parsed
+    report's source file should be archived under, or ``None`` when the
+    report type is unrecognized or its date can't be determined.
+
+    The date comes from the parsed report itself, not the source
+    filename or file mtime: aggregate reports use
+    ``report_metadata.begin_date``, failure reports use
+    ``arrival_date_utc``, and SMTP TLS reports use ``begin_date``.
+    """
+    report_type = result["report_type"]
+    # Only the wall-clock year/month fields are read from the parsed
+    # datetime, so no timezone conversion ever happens here — but tag
+    # the strings whose zone is known, per human_timestamp_to_datetime's
+    # contract. Aggregate begin_date is a local-time string
+    # (timestamp_to_human uses datetime.fromtimestamp) and must stay
+    # naive; arrival_date_utc is UTC wall-clock; SMTP TLS begin_date is
+    # RFC 3339 with an offset, so assume_utc would be a no-op anyway.
+    assume_utc = False
+    try:
+        if result["report_type"] == "aggregate":
+            type_folder = "Aggregate"
+            date_string = result["report"]["report_metadata"]["begin_date"]
+        elif result["report_type"] == "failure":
+            type_folder = "Failure"
+            date_string = result["report"]["arrival_date_utc"]
+            assume_utc = True
+        elif result["report_type"] == "smtp_tls":
+            type_folder = "SMTP-TLS"
+            date_string = result["report"]["begin_date"]
+        else:
+            logger.warning(f"Cannot archive unknown report type: {report_type}")
+            return None
+        dt = human_timestamp_to_datetime(date_string, assume_utc=assume_utc)
+    except (KeyError, TypeError, ValueError, OverflowError) as e:
+        logger.warning(f"Cannot determine archive date for {report_type} report: {e}")
+        return None
+
+    return os.path.join(f"{dt.year:04d}", f"{dt.month:02d}", type_folder)
+
+
+def _move_file_to_archive(file_path: str, dest_dir: str) -> str:
+    """Move *file_path* into *dest_dir*, creating it if needed, and return
+    the final destination path.
+
+    An existing file at the destination is never overwritten: a numeric
+    suffix is appended before the extension (``name-1.xml``,
+    ``name-2.xml``, ...) until a free name is found. For multi-suffix
+    names like ``report.xml.gz`` the numeric suffix lands before the
+    last suffix only (``report.xml-1.gz``); this is acceptable.
+
+    The free-name claim is atomic (``os.open`` with
+    ``O_CREAT | O_EXCL``) rather than an exists-check-then-move: a plain
+    ``os.path.exists()`` check followed by ``shutil.move()`` is a
+    TOCTOU race between concurrent ``parsedmarc`` invocations sharing an
+    archive directory, and ``shutil.move()`` silently overwrites an
+    existing destination on POSIX, which would violate the
+    never-overwrite guarantee. Instead, each candidate name is staked
+    out with a zero-byte placeholder file before the real move happens;
+    ``shutil.move()`` then replaces that placeholder with the real file
+    — atomically via ``os.rename`` when source and destination are on
+    the same POSIX filesystem, otherwise (Windows, or a cross-device
+    move) via a ``copy2``-and-overwrite that is not atomic but still
+    cannot collide with a concurrent invocation, since the placeholder
+    already claimed the name.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    base, ext = os.path.splitext(os.path.basename(file_path))
+    candidate = os.path.basename(file_path)
+    n = 1
+    while True:
+        dest_path = os.path.join(dest_dir, candidate)
+        try:
+            # 0o600 (not os.open's 0o777 default) so a placeholder that
+            # outlives a failed move+cleanup is never executable or
+            # group/other-accessible. The mode never reaches the real
+            # archived file: os.rename replaces the placeholder's inode
+            # outright, and the copy2 fallback's copystat overwrites the
+            # mode with the source file's.
+            fd = os.open(dest_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            candidate = f"{base}-{n}{ext}"
+            n += 1
+            continue
+        os.close(fd)
+        break
+
+    try:
+        shutil.move(file_path, dest_path)
+    except Exception:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            # Best-effort cleanup of the just-created placeholder; the
+            # move failure re-raised below is the error that matters.
+            pass
+        raise
+    return dest_path
+
+
+def _archive_processed_file(
+    file_path: str, archive_directory: str, result: ParsedReport | Exception
+) -> None:
+    """Move *file_path* into *archive_directory* after processing.
+
+    Files that failed to parse as a report (*result* is a
+    ``ParserError`` — every parse-failure exception, including
+    ``InvalidSMTPTLSReport``, subclasses it) go to
+    ``<archive_directory>/Invalid/``. Files that failed for some other
+    reason (a transient ``OSError``/``PermissionError`` from the parse
+    job's broad catch, or an unexpected parser bug) are left in place so
+    a later run can retry them — renaming a valid-but-currently-unreadable
+    report into ``Invalid/`` would permanently sideline it, since moving
+    a file needs no read permission on its contents, and
+    ``_exclude_archived_paths`` would then hide it from every future run
+    too. The parse loop already logged the error either way.
+
+    Successfully parsed files go to the dated ``<year>/<month>/<type>``
+    subdirectory returned by ``_archive_subdir_for_result``; if that
+    returns ``None`` (unknown report type or unparseable date), the file
+    is left in place — a warning was already logged by that helper.
+
+    A move failure is logged and never allowed to abort the run: the
+    file has already been successfully parsed (or definitively failed
+    to parse), so a filesystem error while archiving it should not
+    cause the caller to lose that work.
+    """
+    if isinstance(result, ParserError):
+        subdir = "Invalid"
+    elif isinstance(result, Exception):
+        logger.debug(
+            f"Leaving {file_path} in place: {result.__class__.__name__} is not "
+            "a report-parsing failure, so it may be retryable"
+        )
+        return
+    else:
+        subdir = _archive_subdir_for_result(result)
+        if subdir is None:
+            return
+
+    dest_dir = os.path.join(archive_directory, subdir)
+    try:
+        dest_path = _move_file_to_archive(file_path, dest_dir)
+    except Exception as e:
+        logger.error(f"Error moving {file_path} to the archive: {e}")
+        return
+    logger.debug(f"Archived {file_path} to {dest_path}")
+
+
+# All known INI config section names, used for env var resolution.
+_KNOWN_SECTIONS = frozenset(
+    {
+        "general",
+        "mailbox",
+        "imap",
+        "msgraph",
+        "elasticsearch",
+        "opensearch",
+        "splunk_hec",
+        "kafka",
+        "smtp",
+        "s3",
+        "postgresql",
+        "syslog",
+        "gmail_api",
+        "maildir",
+        "log_analytics",
+        "gelf",
+        "webhook",
+    }
+)
+
+
+# Short aliases that don't follow the PARSEDMARC_{SECTION}_{KEY} pattern.
+_ENV_ALIASES: dict[str, tuple[str, str]] = {
+    "DEBUG": ("general", "debug"),
+    "PARSEDMARC_DEBUG": ("general", "debug"),
+}
+
+# Real config keys whose own names end in ``_file``. For these the
+# ``PARSEDMARC_..._FILE`` env var is the direct value (a path string),
+# not a Docker-secret file reference. Keep in sync with ``_parse_config``
+# whenever a new ``*_file`` config key is added.
+_DIRECT_FILE_KEYS = frozenset(
+    [
+        "GENERAL_LOG_FILE",
+        "MSGRAPH_TOKEN_FILE",
+        "GMAIL_API_CREDENTIALS_FILE",
+        "GMAIL_API_TOKEN_FILE",
+    ]
+)
+
+
+def _resolve_section_key(suffix: str) -> tuple:
+    """Resolve an env var suffix like ``IMAP_PASSWORD`` to ``('imap', 'password')``.
+
+    Uses longest-prefix matching against known section names so that
+    multi-word sections like ``splunk_hec`` are handled correctly.
+
+    Returns ``(None, None)`` when no known section matches.
+    """
+    suffix_lower = suffix.lower()
+
+    best_section = None
+    best_key = None
+    for section in _KNOWN_SECTIONS:
+        section_prefix = section + "_"
+        if suffix_lower.startswith(section_prefix):
+            key = suffix_lower[len(section_prefix) :]
+            if key and (best_section is None or len(section) > len(best_section)):
+                best_section = section
+                best_key = key
+
+    return best_section, best_key
+
+
+def _read_secret_file(env_key: str, raw_path: str) -> str:
+    """Read a Docker-secret file referenced by a ``PARSEDMARC_..._FILE`` env var.
+
+    Strips any trailing CR/LF from the file contents. Raises
+    ``ConfigurationError`` (not a silent fallback) when the file is missing,
+    unreadable, or not valid UTF-8.
+    """
+    path = _expand_path(raw_path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().rstrip("\r\n")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigurationError(
+            f"Cannot read secret file for {env_key}: {path} ({exc.__class__.__name__})"
+        ) from exc
+
+
+def _apply_env_overrides(config: ConfigParser) -> None:
+    """Inject ``PARSEDMARC_*`` environment variables into *config*.
+
+    Environment variables matching ``PARSEDMARC_{SECTION}_{KEY}`` override
+    (or create) the corresponding config-file values. Sections are created
+    automatically when they do not yet exist.
+
+    A ``PARSEDMARC_{SECTION}_{KEY}_FILE`` variant reads the value from the
+    referenced file (Docker / Kubernetes secret convention). When both the
+    direct variable and its ``_FILE`` companion are set, the file wins. The
+    handful of real config keys whose own names end in ``_file`` (see
+    ``_DIRECT_FILE_KEYS``) keep their pre-existing direct-value semantics
+    and are not eligible for the secret-file wrap.
+    """
+    prefix = "PARSEDMARC_"
+    file_suffix = "_FILE"
+
+    direct: dict[tuple[str, str], str] = {}
+    secrets: dict[tuple[str, str], str] = {}
+
+    for env_key, value in os.environ.items():
+        if env_key == "PARSEDMARC_CONFIG_FILE":
+            continue
+        if env_key in _ENV_ALIASES:
+            direct[_ENV_ALIASES[env_key]] = value
+            continue
+        if not env_key.startswith(prefix):
+            continue
+
+        key_body = env_key[len(prefix) :]
+        is_secret = key_body.endswith(file_suffix) and key_body not in _DIRECT_FILE_KEYS
+
+        if is_secret:
+            section, key = _resolve_section_key(key_body[: -len(file_suffix)])
+        else:
+            section, key = _resolve_section_key(key_body)
+
+        if section is None:
+            logger.debug("Ignoring unrecognized env var: %s", env_key)
+            continue
+        if is_secret:
+            value = _read_secret_file(env_key, value)
+            secrets[(section, key)] = value
+        else:
+            direct[(section, key)] = value
+
+    # _FILE entries win over direct ones: dict-unpack lets later mappings overwrite.
+    for (section, key), value in {**direct, **secrets}.items():
+        if not config.has_section(section):
+            config.add_section(section)
+        config.set(section, key, value)
+        logger.debug("Config override from env: [%s] %s", section, key)
+
+
+def _configure_logging(log_level, log_file=None):
+    """
+    Configure logging for the current process.
+    This is needed for child processes to properly log messages.
+
+    Args:
+        log_level: The logging level (e.g., logging.DEBUG, logging.WARNING)
+        log_file: Optional path to log file
+    """
+    from parsedmarc.log import configure_logging
+
+    configure_logging(log_level, log_file)
+
+
+# Loggers of the libraries that implement the mailbox and Microsoft Graph
+# layers. parsedmarc only configures its own logger, so without this list
+# their records — including azure-identity's AADSTS token-endpoint errors,
+# which are what distinguish a local config problem from an Exchange
+# Online / Entra ID one — are silently dropped even with --debug.
+# The Graph SDK's kiota middleware (kiota_http etc.) is deliberately
+# absent: it does not use Python logging (its observability is
+# OpenTelemetry tracing), so there are no records to enable.
+_DEPENDENCY_LOGGERS = (
+    "mailsuite",
+    "azure",
+    "msgraph",
+    "httpx",
+    "httpcore",
+)
+
+
+def _configure_dependency_logging(level: int) -> None:
+    """Apply parsedmarc's logging verbosity to dependency loggers.
+
+    Follows the parsedmarc log level when ``--verbose``/``--debug`` makes it
+    more verbose than WARNING, and stays at WARNING otherwise, so dependency
+    warnings keep surfacing without adding noise at the default level.
+
+    Handlers are synced to exactly the parsedmarc logger's own handlers
+    (console and optional file), so dependency records reach the same
+    destinations, and a SIGHUP reload that swaps the log file neither
+    duplicates output nor keeps writing to a closed handler. Propagation
+    to the root logger is disabled so that a stray ``logging.basicConfig()``
+    anywhere in the process cannot double-print every dependency record.
+    CLI-only: library consumers configure logging themselves.
+    """
+    dep_level = min(level, logging.WARNING)
+    for name in _DEPENDENCY_LOGGERS:
+        dep_logger = logging.getLogger(name)
+        dep_logger.setLevel(dep_level)
+        dep_logger.propagate = False
+        for existing in list(dep_logger.handlers):
+            if existing not in logger.handlers:
+                dep_logger.removeHandler(existing)
+        for wanted in logger.handlers:
+            if wanted not in dep_logger.handlers:
+                dep_logger.addHandler(wanted)
+
+
+def _load_config(config_file: str | None = None) -> ConfigParser:
+    """Load configuration from an INI file and/or environment variables.
+
+    Args:
+        config_file: Optional path to an .ini config file.
+
+    Returns:
+        A ``ConfigParser`` populated from the file (if given) and from any
+        ``PARSEDMARC_*`` environment variables.
+
+    Raises:
+        ConfigurationError: If *config_file* is given but does not exist.
+    """
+    config = ConfigParser(interpolation=None)
+    if config_file is not None:
+        abs_path = os.path.abspath(config_file)
+        if not os.path.exists(abs_path):
+            raise ConfigurationError(f"A file does not exist at {abs_path}")
+        if not os.access(abs_path, os.R_OK):
+            raise ConfigurationError(
+                f"Unable to read {abs_path} — check file permissions"
+            )
+        config.read(config_file)
+    _apply_env_overrides(config)
+    return config
+
+
+def _parse_config(config: ConfigParser, opts):
+    """Apply a loaded ``ConfigParser`` to *opts* in place.
+
+    Args:
+        config: A ``ConfigParser`` (from ``_load_config``).
+        opts: Namespace object to update with parsed values.
+
+    Returns:
+        index_prefix_domain_map or None
+
+    Raises:
+        ConfigurationError: If required settings are missing or invalid.
+    """
+    opts.silent = True
+    index_prefix_domain_map = None
+    if "general" in config.sections():
+        general_config = config["general"]
+        if "silent" in general_config:
+            opts.silent = bool(general_config.getboolean("silent"))
+        if "normalize_timespan_threshold_hours" in general_config:
+            opts.normalize_timespan_threshold_hours = general_config.getfloat(
+                "normalize_timespan_threshold_hours"
+            )
+        if "index_prefix_domain_map" in general_config:
+            with open(_expand_path(general_config["index_prefix_domain_map"])) as f:
+                index_prefix_domain_map = yaml.safe_load(f)
+            # An empty file loads as None, which means "unset". Anything else
+            # must be a mapping of tenant name to a list of domain names, all
+            # strings: the save path iterates the keys as index name prefixes
+            # and tests `get_base_domain(...).lower() in <value>`. Every other
+            # shape fails silently rather than loudly -- a scalar value makes
+            # that an `in` on a str, which is a substring test, so it matches
+            # the wrong domains ("example.co" in "example.com" is True), and a
+            # non-string list item simply never compares equal to any domain.
+            if index_prefix_domain_map is not None and (
+                not isinstance(index_prefix_domain_map, dict)
+                or not all(
+                    isinstance(key, str)
+                    and isinstance(value, list)
+                    and all(isinstance(domain, str) for domain in value)
+                    for key, value in index_prefix_domain_map.items()
+                )
+            ):
+                raise ConfigurationError(
+                    "index_prefix_domain_map must be a YAML mapping of tenant "
+                    "name to a list of domain names, all strings"
+                )
+        if "offline" in general_config:
+            opts.offline = bool(general_config.getboolean("offline"))
+        if "strip_attachment_payloads" in general_config:
+            opts.strip_attachment_payloads = bool(
+                general_config.getboolean("strip_attachment_payloads")
+            )
+        if "output" in general_config:
+            opts.output = _expand_path(general_config["output"])
+        if "archive_directory" in general_config:
+            opts.archive_directory = _expand_path(general_config["archive_directory"])
+        if "aggregate_json_filename" in general_config:
+            opts.aggregate_json_filename = general_config["aggregate_json_filename"]
+        if "failure_json_filename" in general_config:
+            opts.failure_json_filename = general_config["failure_json_filename"]
+        elif "forensic_json_filename" in general_config:
+            opts.failure_json_filename = general_config["forensic_json_filename"]
+        if "smtp_tls_json_filename" in general_config:
+            opts.smtp_tls_json_filename = general_config["smtp_tls_json_filename"]
+        if "aggregate_csv_filename" in general_config:
+            opts.aggregate_csv_filename = general_config["aggregate_csv_filename"]
+        if "failure_csv_filename" in general_config:
+            opts.failure_csv_filename = general_config["failure_csv_filename"]
+        elif "forensic_csv_filename" in general_config:
+            opts.failure_csv_filename = general_config["forensic_csv_filename"]
+        if "smtp_tls_csv_filename" in general_config:
+            opts.smtp_tls_csv_filename = general_config["smtp_tls_csv_filename"]
+        if "dns_timeout" in general_config:
+            opts.dns_timeout = general_config.getfloat("dns_timeout")
+            if opts.dns_timeout is None:
+                opts.dns_timeout = 2
+        if "dns_retries" in general_config:
+            opts.dns_retries = general_config.getint("dns_retries")
+            if opts.dns_retries is None:
+                opts.dns_retries = 0
+        if "dns_test_address" in general_config:
+            opts.dns_test_address = general_config["dns_test_address"]
+        if "nameservers" in general_config:
+            opts.nameservers = _str_to_list(general_config["nameservers"])
+            # nameservers pre-flight check
+            dummy_hostname = None
+            try:
+                dummy_hostname = get_reverse_dns(
+                    opts.dns_test_address,
+                    nameservers=opts.nameservers,
+                    timeout=opts.dns_timeout,
+                )
+            except Exception as ns_error:
+                raise ConfigurationError(
+                    f"DNS pre-flight check failed: {ns_error}"
+                ) from ns_error
+            if not dummy_hostname:
+                raise ConfigurationError(
+                    f"DNS pre-flight check failed: no PTR record for {opts.dns_test_address} from {opts.nameservers}"
+                )
+        if "save_aggregate" in general_config:
+            opts.save_aggregate = bool(general_config.getboolean("save_aggregate"))
+        if "save_failure" in general_config:
+            opts.save_failure = bool(general_config.getboolean("save_failure"))
+        elif "save_forensic" in general_config:
+            opts.save_failure = bool(general_config.getboolean("save_forensic"))
+        if "save_smtp_tls" in general_config:
+            opts.save_smtp_tls = bool(general_config.getboolean("save_smtp_tls"))
+        if "debug" in general_config:
+            opts.debug = bool(general_config.getboolean("debug"))
+        if "verbose" in general_config:
+            opts.verbose = bool(general_config.getboolean("verbose"))
+        if "warnings" in general_config:
+            opts.warnings = bool(general_config.getboolean("warnings"))
+        if "fail_on_output_error" in general_config:
+            opts.fail_on_output_error = bool(
+                general_config.getboolean("fail_on_output_error")
+            )
+        if "log_file" in general_config:
+            opts.log_file = _expand_path(general_config["log_file"])
+        if "n_procs" in general_config:
+            opts.n_procs = general_config.getint("n_procs")
+        if "ip_db_path" in general_config:
+            opts.ip_db_path = _expand_path(general_config["ip_db_path"])
+        else:
+            opts.ip_db_path = None
+        if "ipinfo_url" in general_config:
+            opts.ipinfo_url = general_config["ipinfo_url"]
+        elif "ip_db_url" in general_config:
+            # ``ip_db_url`` is the pre-9.10 name for the same option. Accept
+            # it as a deprecated alias; prefer ``ipinfo_url`` going forward.
+            opts.ipinfo_url = general_config["ip_db_url"]
+            logger.warning("[general] ip_db_url is deprecated; rename it to ipinfo_url")
+        if "ipinfo_api_token" in general_config:
+            opts.ipinfo_api_token = general_config["ipinfo_api_token"]
+        if "always_use_local_files" in general_config:
+            opts.always_use_local_files = bool(
+                general_config.getboolean("always_use_local_files")
+            )
+        if "local_reverse_dns_map_path" in general_config:
+            opts.reverse_dns_map_path = _expand_path(
+                general_config["local_reverse_dns_map_path"]
+            )
+        if "reverse_dns_map_url" in general_config:
+            opts.reverse_dns_map_url = general_config["reverse_dns_map_url"]
+        if "local_psl_overrides_path" in general_config:
+            opts.psl_overrides_path = _expand_path(
+                general_config["local_psl_overrides_path"]
+            )
+        if "psl_overrides_url" in general_config:
+            opts.psl_overrides_url = general_config["psl_overrides_url"]
+        if "prettify_json" in general_config:
+            opts.prettify_json = bool(general_config.getboolean("prettify_json"))
+
+    if "mailbox" in config.sections():
+        mailbox_config = config["mailbox"]
+        if "msgraph" in config.sections():
+            opts.mailbox_reports_folder = "Inbox"
+        if "reports_folder" in mailbox_config:
+            opts.mailbox_reports_folder = mailbox_config["reports_folder"]
+        if "archive_folder" in mailbox_config:
+            opts.mailbox_archive_folder = mailbox_config["archive_folder"]
+        if "watch" in mailbox_config:
+            opts.mailbox_watch = bool(mailbox_config.getboolean("watch"))
+        if "delete" in mailbox_config:
+            opts.mailbox_delete = bool(mailbox_config.getboolean("delete"))
+        if "delete_aggregate" in mailbox_config:
+            opts.mailbox_delete_aggregate = bool(
+                mailbox_config.getboolean("delete_aggregate")
+            )
+        if "delete_failure" in mailbox_config:
+            opts.mailbox_delete_failure = bool(
+                mailbox_config.getboolean("delete_failure")
+            )
+        if "delete_smtp_tls" in mailbox_config:
+            opts.mailbox_delete_smtp_tls = bool(
+                mailbox_config.getboolean("delete_smtp_tls")
+            )
+        if "delete_invalid" in mailbox_config:
+            opts.mailbox_delete_invalid = bool(
+                mailbox_config.getboolean("delete_invalid")
+            )
+        if "test" in mailbox_config:
+            opts.mailbox_test = bool(mailbox_config.getboolean("test"))
+        if "batch_size" in mailbox_config:
+            opts.mailbox_batch_size = mailbox_config.getint("batch_size")
+        if "check_timeout" in mailbox_config:
+            opts.mailbox_check_timeout = mailbox_config.getint("check_timeout")
+        if "max_unsaved_retries" in mailbox_config:
+            opts.mailbox_max_unsaved_retries = mailbox_config.getint(
+                "max_unsaved_retries"
+            )
+        if "since" in mailbox_config:
+            opts.mailbox_since = mailbox_config["since"]
+
+    if "imap" in config.sections():
+        imap_config = config["imap"]
+        if "watch" in imap_config:
+            logger.warning(
+                "Starting in 8.0.0, the watch option has been "
+                "moved from the imap configuration section to "
+                "the mailbox configuration section."
+            )
+        if "host" in imap_config:
+            opts.imap_host = imap_config["host"]
+        else:
+            raise ConfigurationError(
+                "host setting missing from the imap config section"
+            )
+        if "port" in imap_config:
+            opts.imap_port = imap_config.getint("port")
+        if "timeout" in imap_config:
+            opts.imap_timeout = imap_config.getint("timeout")
+        if "max_retries" in imap_config:
+            opts.imap_max_retries = imap_config.getint("max_retries")
+        if "ssl" in imap_config:
+            opts.imap_ssl = bool(imap_config.getboolean("ssl"))
+        if "skip_certificate_verification" in imap_config:
+            opts.imap_skip_certificate_verification = bool(
+                imap_config.getboolean("skip_certificate_verification")
+            )
+        if "user" in imap_config:
+            opts.imap_user = imap_config["user"]
+        else:
+            raise ConfigurationError(
+                "user setting missing from the imap config section"
+            )
+        if "password" in imap_config:
+            opts.imap_password = imap_config["password"]
+        else:
+            raise ConfigurationError(
+                "password setting missing from the imap config section"
+            )
+        if "reports_folder" in imap_config:
+            opts.mailbox_reports_folder = imap_config["reports_folder"]
+            logger.warning(
+                "Use of the reports_folder option in the imap "
+                "configuration section has been deprecated. "
+                "Use this option in the mailbox configuration "
+                "section instead."
+            )
+        if "archive_folder" in imap_config:
+            opts.mailbox_archive_folder = imap_config["archive_folder"]
+            logger.warning(
+                "Use of the archive_folder option in the imap "
+                "configuration section has been deprecated. "
+                "Use this option in the mailbox configuration "
+                "section instead."
+            )
+        if "watch" in imap_config:
+            opts.mailbox_watch = bool(imap_config.getboolean("watch"))
+            logger.warning(
+                "Use of the watch option in the imap "
+                "configuration section has been deprecated. "
+                "Use this option in the mailbox configuration "
+                "section instead."
+            )
+        if "delete" in imap_config:
+            logger.warning(
+                "Use of the delete option in the imap "
+                "configuration section has been deprecated. "
+                "Use this option in the mailbox configuration "
+                "section instead."
+            )
+        if "test" in imap_config:
+            opts.mailbox_test = bool(imap_config.getboolean("test"))
+            logger.warning(
+                "Use of the test option in the imap "
+                "configuration section has been deprecated. "
+                "Use this option in the mailbox configuration "
+                "section instead."
+            )
+        if "batch_size" in imap_config:
+            opts.mailbox_batch_size = imap_config.getint("batch_size")
+            logger.warning(
+                "Use of the batch_size option in the imap "
+                "configuration section has been deprecated. "
+                "Use this option in the mailbox configuration "
+                "section instead."
+            )
+
+    if "msgraph" in config.sections():
+        graph_config = config["msgraph"]
+        opts.graph_token_file = _expand_path(graph_config.get("token_file", ".token"))
+
+        if "auth_method" not in graph_config:
+            logger.info(
+                "auth_method setting missing from the "
+                "msgraph config section "
+                "defaulting to UsernamePassword"
+            )
+            opts.graph_auth_method = AuthMethod.UsernamePassword.name
+        else:
+            opts.graph_auth_method = _normalize_graph_auth_method(
+                graph_config["auth_method"]
+            )
+
+        if opts.graph_auth_method == AuthMethod.UsernamePassword.name:
+            if "user" in graph_config:
+                opts.graph_user = graph_config["user"]
+            else:
+                raise ConfigurationError(
+                    "user setting missing from the msgraph config section"
+                )
+            if "password" in graph_config:
+                opts.graph_password = graph_config["password"]
+            else:
+                raise ConfigurationError(
+                    "password setting missing from the msgraph config section"
+                )
+            if "client_secret" in graph_config:
+                opts.graph_client_secret = graph_config["client_secret"]
+            else:
+                raise ConfigurationError(
+                    "client_secret setting missing from the msgraph config section"
+                )
+
+        if opts.graph_auth_method == AuthMethod.DeviceCode.name:
+            if "user" in graph_config:
+                opts.graph_user = graph_config["user"]
+
+        if opts.graph_auth_method != AuthMethod.UsernamePassword.name:
+            if "tenant_id" in graph_config:
+                opts.graph_tenant_id = graph_config["tenant_id"]
+            else:
+                raise ConfigurationError(
+                    "tenant_id setting missing from the msgraph config section"
+                )
+
+        if opts.graph_auth_method == AuthMethod.ClientSecret.name:
+            if "client_secret" in graph_config:
+                opts.graph_client_secret = graph_config["client_secret"]
+            else:
+                raise ConfigurationError(
+                    "client_secret setting missing from the msgraph config section"
+                )
+
+        if opts.graph_auth_method == AuthMethod.Certificate.name:
+            if "certificate_path" in graph_config:
+                opts.graph_certificate_path = _expand_path(
+                    graph_config["certificate_path"]
+                )
+            else:
+                raise ConfigurationError(
+                    "certificate_path setting missing from the msgraph config section"
+                )
+            if "certificate_password" in graph_config:
+                opts.graph_certificate_password = graph_config["certificate_password"]
+
+        if opts.graph_auth_method == AuthMethod.ClientAssertion.name:
+            if "client_assertion" in graph_config:
+                opts.graph_client_assertion = graph_config["client_assertion"]
+            else:
+                raise ConfigurationError(
+                    "client_assertion setting missing from the msgraph config section"
+                )
+
+        if "client_id" in graph_config:
+            opts.graph_client_id = graph_config["client_id"]
+        else:
+            raise ConfigurationError(
+                "client_id setting missing from the msgraph config section"
+            )
+
+        if "mailbox" in graph_config:
+            opts.graph_mailbox = graph_config["mailbox"]
+        elif opts.graph_auth_method != AuthMethod.UsernamePassword.name:
+            raise ConfigurationError(
+                "mailbox setting missing from the msgraph config section"
+            )
+
+        if "graph_url" in graph_config:
+            opts.graph_url = graph_config["graph_url"]
+        elif "url" in graph_config:
+            opts.graph_url = graph_config["url"]
+
+        if "allow_unencrypted_storage" in graph_config:
+            opts.graph_allow_unencrypted_storage = bool(
+                graph_config.getboolean("allow_unencrypted_storage")
+            )
+
+    if "elasticsearch" in config:
+        elasticsearch_config = config["elasticsearch"]
+        if "hosts" in elasticsearch_config:
+            opts.elasticsearch_hosts = _str_to_list(elasticsearch_config["hosts"])
+        else:
+            raise ConfigurationError(
+                "hosts setting missing from the elasticsearch config section"
+            )
+        if "timeout" in elasticsearch_config:
+            timeout = elasticsearch_config.getfloat("timeout")
+            opts.elasticsearch_timeout = timeout
+        if "number_of_shards" in elasticsearch_config:
+            number_of_shards = elasticsearch_config.getint("number_of_shards")
+            opts.elasticsearch_number_of_shards = number_of_shards
+            if "number_of_replicas" in elasticsearch_config:
+                number_of_replicas = elasticsearch_config.getint("number_of_replicas")
+                opts.elasticsearch_number_of_replicas = number_of_replicas
+        if "index_suffix" in elasticsearch_config:
+            opts.elasticsearch_index_suffix = elasticsearch_config["index_suffix"]
+        if "index_prefix" in elasticsearch_config:
+            opts.elasticsearch_index_prefix = elasticsearch_config["index_prefix"]
+        if "monthly_indexes" in elasticsearch_config:
+            monthly = bool(elasticsearch_config.getboolean("monthly_indexes"))
+            opts.elasticsearch_monthly_indexes = monthly
+        if "ssl" in elasticsearch_config:
+            opts.elasticsearch_ssl = bool(elasticsearch_config.getboolean("ssl"))
+        if "cert_path" in elasticsearch_config:
+            opts.elasticsearch_ssl_cert_path = _expand_path(
+                elasticsearch_config["cert_path"]
+            )
+        if "skip_certificate_verification" in elasticsearch_config:
+            opts.elasticsearch_skip_certificate_verification = bool(
+                elasticsearch_config.getboolean("skip_certificate_verification")
+            )
+        if "user" in elasticsearch_config:
+            opts.elasticsearch_username = elasticsearch_config["user"]
+        if "password" in elasticsearch_config:
+            opts.elasticsearch_password = elasticsearch_config["password"]
+        # Until 8.20
+        if "apiKey" in elasticsearch_config:
+            opts.elasticsearch_api_key = elasticsearch_config["apiKey"]
+        # Since 8.20
+        if "api_key" in elasticsearch_config:
+            opts.elasticsearch_api_key = elasticsearch_config["api_key"]
+        if "serverless" in elasticsearch_config:
+            opts.elasticsearch_serverless = elasticsearch_config.getboolean(
+                "serverless"
+            )
+
+    if "opensearch" in config:
+        opensearch_config = config["opensearch"]
+        if "hosts" in opensearch_config:
+            opts.opensearch_hosts = _str_to_list(opensearch_config["hosts"])
+        else:
+            raise ConfigurationError(
+                "hosts setting missing from the opensearch config section"
+            )
+        if "timeout" in opensearch_config:
+            timeout = opensearch_config.getfloat("timeout")
+            opts.opensearch_timeout = timeout
+        if "number_of_shards" in opensearch_config:
+            number_of_shards = opensearch_config.getint("number_of_shards")
+            opts.opensearch_number_of_shards = number_of_shards
+            if "number_of_replicas" in opensearch_config:
+                number_of_replicas = opensearch_config.getint("number_of_replicas")
+                opts.opensearch_number_of_replicas = number_of_replicas
+        if "index_suffix" in opensearch_config:
+            opts.opensearch_index_suffix = opensearch_config["index_suffix"]
+        if "index_prefix" in opensearch_config:
+            opts.opensearch_index_prefix = opensearch_config["index_prefix"]
+        if "monthly_indexes" in opensearch_config:
+            monthly = bool(opensearch_config.getboolean("monthly_indexes"))
+            opts.opensearch_monthly_indexes = monthly
+        if "ssl" in opensearch_config:
+            opts.opensearch_ssl = bool(opensearch_config.getboolean("ssl"))
+        if "cert_path" in opensearch_config:
+            opts.opensearch_ssl_cert_path = _expand_path(opensearch_config["cert_path"])
+        if "skip_certificate_verification" in opensearch_config:
+            opts.opensearch_skip_certificate_verification = bool(
+                opensearch_config.getboolean("skip_certificate_verification")
+            )
+        if "user" in opensearch_config:
+            opts.opensearch_username = opensearch_config["user"]
+        if "password" in opensearch_config:
+            opts.opensearch_password = opensearch_config["password"]
+        # Until 8.20
+        if "apiKey" in opensearch_config:
+            opts.opensearch_api_key = opensearch_config["apiKey"]
+        # Since 8.20
+        if "api_key" in opensearch_config:
+            opts.opensearch_api_key = opensearch_config["api_key"]
+        if "auth_type" in opensearch_config:
+            opts.opensearch_auth_type = opensearch_config["auth_type"].strip().lower()
+        elif "authentication_type" in opensearch_config:
+            opts.opensearch_auth_type = (
+                opensearch_config["authentication_type"].strip().lower()
+            )
+        if "aws_region" in opensearch_config:
+            opts.opensearch_aws_region = opensearch_config["aws_region"].strip()
+        if "aws_service" in opensearch_config:
+            opts.opensearch_aws_service = opensearch_config["aws_service"].strip()
+
+    if "splunk_hec" in config.sections():
+        hec_config = config["splunk_hec"]
+        if "url" in hec_config:
+            opts.hec = hec_config["url"]
+        else:
+            raise ConfigurationError(
+                "url setting missing from the splunk_hec config section"
+            )
+        if "token" in hec_config:
+            opts.hec_token = hec_config["token"]
+        else:
+            raise ConfigurationError(
+                "token setting missing from the splunk_hec config section"
+            )
+        if "index" in hec_config:
+            opts.hec_index = hec_config["index"]
+        else:
+            raise ConfigurationError(
+                "index setting missing from the splunk_hec config section"
+            )
+        if "skip_certificate_verification" in hec_config:
+            opts.hec_skip_certificate_verification = bool(
+                hec_config.getboolean("skip_certificate_verification", fallback=False)
+            )
+
+    if "kafka" in config.sections():
+        kafka_config = config["kafka"]
+        if "hosts" in kafka_config:
+            opts.kafka_hosts = _str_to_list(kafka_config["hosts"])
+        else:
+            raise ConfigurationError(
+                "hosts setting missing from the kafka config section"
+            )
+        if "user" in kafka_config:
+            opts.kafka_username = kafka_config["user"]
+        if "password" in kafka_config:
+            opts.kafka_password = kafka_config["password"]
+        if "ssl" in kafka_config:
+            opts.kafka_ssl = bool(kafka_config.getboolean("ssl"))
+        if "skip_certificate_verification" in kafka_config:
+            kafka_verify = bool(
+                kafka_config.getboolean("skip_certificate_verification")
+            )
+            opts.kafka_skip_certificate_verification = kafka_verify
+        if "aggregate_topic" in kafka_config:
+            opts.kafka_aggregate_topic = kafka_config["aggregate_topic"]
+        else:
+            raise ConfigurationError(
+                "aggregate_topic setting missing from the kafka config section"
+            )
+        if "failure_topic" in kafka_config:
+            opts.kafka_failure_topic = kafka_config["failure_topic"]
+        elif "forensic_topic" in kafka_config:
+            opts.kafka_failure_topic = kafka_config["forensic_topic"]
+        else:
+            raise ConfigurationError(
+                "failure_topic setting missing from the kafka config section"
+            )
+        if "smtp_tls_topic" in kafka_config:
+            opts.kafka_smtp_tls_topic = kafka_config["smtp_tls_topic"]
+        else:
+            raise ConfigurationError(
+                "smtp_tls_topic setting missing from the kafka config section"
+            )
+
+    if "smtp" in config.sections():
+        smtp_config = config["smtp"]
+        if "host" in smtp_config:
+            opts.smtp_host = smtp_config["host"]
+            if "user" in smtp_config:
+                opts.smtp_user = smtp_config["user"]
+            else:
+                raise ConfigurationError(
+                    "user setting missing from the smtp config section"
+                )
+            if "password" in smtp_config:
+                opts.smtp_password = smtp_config["password"]
+            else:
+                raise ConfigurationError(
+                    "password setting missing from the smtp config section"
+                )
+            if "from" in smtp_config:
+                opts.smtp_from = smtp_config["from"]
+            else:
+                logger.critical("from setting missing from the smtp config section")
+        elif getattr(opts, "graph_client_id", None):
+            # host is SMTP-only; when [msgraph] is configured, the
+            # summary email is sent via the same Graph mailbox connection
+            # instead, so host/user/password/from are not required here.
+            pass
+        else:
+            raise ConfigurationError(
+                "host setting missing from the smtp config section"
+            )
+        if "port" in smtp_config:
+            opts.smtp_port = smtp_config.getint("port")
+        if "ssl" in smtp_config:
+            opts.smtp_ssl = bool(smtp_config.getboolean("ssl"))
+        if "skip_certificate_verification" in smtp_config:
+            smtp_verify = bool(smtp_config.getboolean("skip_certificate_verification"))
+            opts.smtp_skip_certificate_verification = smtp_verify
+        if "to" in smtp_config:
+            opts.smtp_to = _str_to_list(smtp_config["to"])
+        else:
+            logger.critical("to setting missing from the smtp config section")
+        if "subject" in smtp_config:
+            opts.smtp_subject = smtp_config["subject"]
+        if "attachment" in smtp_config:
+            opts.smtp_attachment = _expand_path(smtp_config["attachment"])
+        if "message" in smtp_config:
+            opts.smtp_message = smtp_config["message"]
+
+    if "s3" in config.sections():
+        s3_config = config["s3"]
+        if "bucket" in s3_config:
+            opts.s3_bucket = s3_config["bucket"]
+        else:
+            raise ConfigurationError(
+                "bucket setting missing from the s3 config section"
+            )
+        if "path" in s3_config:
+            opts.s3_path = s3_config["path"]
+            if opts.s3_path.startswith("/"):
+                opts.s3_path = opts.s3_path[1:]
+            if opts.s3_path.endswith("/"):
+                opts.s3_path = opts.s3_path[:-1]
+        else:
+            opts.s3_path = ""
+
+        if "region_name" in s3_config:
+            opts.s3_region_name = s3_config["region_name"]
+        if "endpoint_url" in s3_config:
+            opts.s3_endpoint_url = s3_config["endpoint_url"]
+        if "access_key_id" in s3_config:
+            opts.s3_access_key_id = s3_config["access_key_id"]
+        if "secret_access_key" in s3_config:
+            opts.s3_secret_access_key = s3_config["secret_access_key"]
+
+    if "postgresql" in config.sections():
+        pg_config = config["postgresql"]
+        if "connection_string" in pg_config:
+            opts.postgresql_connection_string = pg_config["connection_string"]
+        elif "host" in pg_config:
+            opts.postgresql_host = pg_config["host"]
+            if "port" in pg_config:
+                opts.postgresql_port = pg_config.getint("port")
+            if "user" in pg_config:
+                opts.postgresql_user = pg_config["user"]
+            if "password" in pg_config:
+                opts.postgresql_password = pg_config["password"]
+            if "database" in pg_config:
+                opts.postgresql_database = pg_config["database"]
+        else:
+            raise ConfigurationError(
+                "host (or connection_string) setting missing from the "
+                "postgresql config section"
+            )
+
+    if "syslog" in config.sections():
+        syslog_config = config["syslog"]
+        if "server" in syslog_config:
+            opts.syslog_server = syslog_config["server"]
+        else:
+            raise ConfigurationError(
+                "server setting missing from the syslog config section"
+            )
+        if "port" in syslog_config:
+            opts.syslog_port = syslog_config["port"]
+        else:
+            opts.syslog_port = 514
+        if "protocol" in syslog_config:
+            opts.syslog_protocol = syslog_config["protocol"]
+        else:
+            opts.syslog_protocol = "udp"
+        if "cafile_path" in syslog_config:
+            opts.syslog_cafile_path = _expand_path(syslog_config["cafile_path"])
+        if "certfile_path" in syslog_config:
+            opts.syslog_certfile_path = _expand_path(syslog_config["certfile_path"])
+        if "keyfile_path" in syslog_config:
+            opts.syslog_keyfile_path = _expand_path(syslog_config["keyfile_path"])
+        if "timeout" in syslog_config:
+            opts.syslog_timeout = float(syslog_config["timeout"])
+        else:
+            opts.syslog_timeout = 5.0
+        if "retry_attempts" in syslog_config:
+            opts.syslog_retry_attempts = int(syslog_config["retry_attempts"])
+        else:
+            opts.syslog_retry_attempts = 3
+        if "retry_delay" in syslog_config:
+            opts.syslog_retry_delay = int(syslog_config["retry_delay"])
+        else:
+            opts.syslog_retry_delay = 5
+
+    if "gmail_api" in config.sections():
+        gmail_api_config = config["gmail_api"]
+        gmail_creds = gmail_api_config.get("credentials_file")
+        opts.gmail_api_credentials_file = (
+            _expand_path(gmail_creds) if gmail_creds else gmail_creds
+        )
+        opts.gmail_api_token_file = _expand_path(
+            gmail_api_config.get("token_file", ".token")
+        )
+        opts.gmail_api_include_spam_trash = bool(
+            gmail_api_config.getboolean("include_spam_trash", False)
+        )
+        opts.gmail_api_paginate_messages = bool(
+            gmail_api_config.getboolean("paginate_messages", True)
+        )
+        default_gmail_api_scope = "https://www.googleapis.com/auth/gmail.modify"
+        opts.gmail_api_scopes = gmail_api_config.get("scopes", default_gmail_api_scope)
+        opts.gmail_api_scopes = _str_to_list(opts.gmail_api_scopes)
+        if "oauth2_port" in gmail_api_config:
+            opts.gmail_api_oauth2_port = gmail_api_config.getint("oauth2_port", 8080)
+        if "auth_mode" in gmail_api_config:
+            opts.gmail_api_auth_mode = gmail_api_config["auth_mode"].strip()
+        if "service_account_user" in gmail_api_config:
+            opts.gmail_api_service_account_user = gmail_api_config[
+                "service_account_user"
+            ].strip()
+        elif "delegated_user" in gmail_api_config:
+            opts.gmail_api_service_account_user = gmail_api_config[
+                "delegated_user"
+            ].strip()
+
+    if "maildir" in config.sections():
+        maildir_api_config = config["maildir"]
+        maildir_p = maildir_api_config.get(
+            "maildir_path", maildir_api_config.get("path")
+        )
+        opts.maildir_path = _expand_path(maildir_p) if maildir_p else maildir_p
+        opts.maildir_create = bool(
+            maildir_api_config.getboolean(
+                "maildir_create",
+                fallback=maildir_api_config.getboolean("create", fallback=False),
+            )
+        )
+
+    if "log_analytics" in config.sections():
+        log_analytics_config = config["log_analytics"]
+        opts.la_client_id = log_analytics_config.get("client_id")
+        opts.la_client_secret = log_analytics_config.get("client_secret")
+        opts.la_tenant_id = log_analytics_config.get("tenant_id")
+        opts.la_dce = log_analytics_config.get("dce")
+        opts.la_dcr_immutable_id = log_analytics_config.get("dcr_immutable_id")
+        opts.la_dcr_aggregate_stream = log_analytics_config.get("dcr_aggregate_stream")
+        opts.la_dcr_failure_stream = log_analytics_config.get(
+            "dcr_failure_stream"
+        ) or log_analytics_config.get("dcr_forensic_stream")
+        opts.la_dcr_smtp_tls_stream = log_analytics_config.get("dcr_smtp_tls_stream")
+
+    if "gelf" in config.sections():
+        gelf_config = config["gelf"]
+        if "host" in gelf_config:
+            opts.gelf_host = gelf_config["host"]
+        else:
+            raise ConfigurationError(
+                "host setting missing from the gelf config section"
+            )
+        if "port" in gelf_config:
+            opts.gelf_port = gelf_config["port"]
+        else:
+            raise ConfigurationError(
+                "port setting missing from the gelf config section"
+            )
+        if "mode" in gelf_config:
+            opts.gelf_mode = gelf_config["mode"]
+        else:
+            raise ConfigurationError(
+                "mode setting missing from the gelf config section"
+            )
+
+    if "webhook" in config.sections():
+        webhook_config = config["webhook"]
+        if "aggregate_url" in webhook_config:
+            opts.webhook_aggregate_url = webhook_config["aggregate_url"]
+        if "failure_url" in webhook_config:
+            opts.webhook_failure_url = webhook_config["failure_url"]
+        elif "forensic_url" in webhook_config:
+            opts.webhook_failure_url = webhook_config["forensic_url"]
+        if "smtp_tls_url" in webhook_config:
+            opts.webhook_smtp_tls_url = webhook_config["smtp_tls_url"]
+        if "timeout" in webhook_config:
+            opts.webhook_timeout = webhook_config.getint("timeout")
+
+    return index_prefix_domain_map
+
+
+class _ElasticsearchHandle:
+    """Sentinel so Elasticsearch participates in _close_output_clients."""
+
+    def close(self):
+        try:
+            conn = elastic.connections.get_connection()
+            if not isinstance(conn, str):
+                conn.close()
+        except Exception:
+            pass
+        try:
+            elastic.connections.remove_connection("default")
+        except Exception:
+            pass
+
+
+class _OpenSearchHandle:
+    """Sentinel so OpenSearch participates in _close_output_clients."""
+
+    def close(self):
+        try:
+            conn = opensearch.connections.get_connection()
+            if not isinstance(conn, str):
+                conn.close()
+        except Exception:
+            pass
+        try:
+            opensearch.connections.remove_connection("default")
+        except Exception:
+            pass
+
+
+def _normalize_index_prefix(prefix):
+    """Normalize an ``index_prefix_domain_map`` key into an index name prefix.
+
+    Lowercases, strips surrounding whitespace and then surrounding
+    underscores, replaces the remaining spaces and hyphens with
+    underscores, and appends a trailing ``_``.
+
+    Shared by the save path (``get_index_prefix()`` in :func:`_main`) and the
+    migration path (:func:`_migration_index_names`) so that the indexes
+    parsedmarc migrates cannot drift from the ones it writes to.
+
+    A key that normalizes to the empty string (``"_"``, ``"  "``) yields the
+    literal ``"_"``. That is deliberate: it is exactly the prefix the save
+    path produces for such a key, so it is the prefix its documents live
+    under.
+
+    The ``[elasticsearch]``/``[opensearch]`` ``index_prefix`` option is never
+    passed through this function -- the save path uses that option verbatim,
+    so the migration path must too.
+
+    Args:
+        prefix (str): A key from ``index_prefix_domain_map``.
+
+    Returns:
+        str: The index name prefix, including its trailing underscore.
+    """
+    prefix = prefix.lower().strip().strip("_").replace(" ", "_").replace("-", "_")
+    return f"{prefix}_"
+
+
+def _migration_index_names(
+    base_name, index_suffix, configured_prefix, index_prefix_domain_map
+):
+    """Resolve every index name an index migration should target.
+
+    Mirrors the way save time builds index names, which is
+    ``{prefix}{base_name}_{index_suffix}-{date}``, and widens each of the
+    two configurable axes so that a migration cannot silently skip indexes
+    the deployment holds data in (issue #868).
+
+    **Suffix axis.** When ``index_suffix`` is set, the suffixed name (what
+    this deployment writes today) and the bare ``base_name`` are both
+    returned, suffixed first. The bare name covers
+    documents indexed before the suffix was configured, or under a previous
+    one; without it, ``dmarc_aggregate_prod*`` matches none of the
+    operator's own ``dmarc_aggregate-*`` indexes. Because callers turn each
+    name into an ``f"{name}*"`` pattern, the bare name's pattern is a strict
+    superset of the suffixed one: on a shared cluster it also matches other
+    deployments' suffixes, and on the first run after an upgrade both
+    patterns can submit an overlapping ``update_by_query``. That is safe --
+    the backfill scripts only set a field that is missing, and submissions
+    use ``conflicts="proceed"`` -- but it is a deliberate trade of
+    narrowness for coverage of the operator's own history.
+
+    **Prefix axis.** A configured ``index_prefix`` wins outright and
+    suppresses the ``index_prefix_domain_map`` fan-out, because such a
+    deployment writes only under that prefix and must not touch index
+    patterns it does not own. Truthiness decides, matching the save path's
+    ``opts.*_index_prefix or get_index_prefix(report)``. Otherwise the
+    unprefixed name comes first, followed by one name per map key --
+    normalized by :func:`_normalize_index_prefix`, in map order. The
+    unprefixed name has to stay: aggregate and failure reports for a domain
+    that is absent from the map are still saved without a prefix, and
+    indexes predating the map exist for every report type.
+
+    ``configured_prefix`` is used verbatim, never normalized, for parity
+    with the save path.
+
+    Args:
+        base_name (str): The unprefixed, unsuffixed index name, e.g.
+            ``"dmarc_aggregate"``.
+        index_suffix (str | None): The configured ``index_suffix``, or
+            ``None``/``""`` when none is configured.
+        configured_prefix (str | None): The configured ``index_prefix``, or
+            ``None``/``""`` when none is configured.
+        index_prefix_domain_map (dict | None): The parsed
+            ``general.index_prefix_domain_map``, or ``None`` when
+            multi-tenant prefixing is not configured.
+
+    Returns:
+        list: Index names, deduplicated, in first-seen order. With nothing
+        configured this is just ``[base_name]``.
+    """
+    bases = [base_name]
+    if index_suffix:
+        bases.insert(0, f"{base_name}_{index_suffix}")
+
+    if configured_prefix:
+        prefixes = [configured_prefix]
+    else:
+        prefixes = [""]
+        for key in index_prefix_domain_map or {}:
+            prefix = _normalize_index_prefix(key)
+            if prefix not in prefixes:
+                prefixes.append(prefix)
+
+    names = []
+    for prefix in prefixes:
+        for base in bases:
+            name = f"{prefix}{base}"
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def _init_output_clients(opts, index_prefix_domain_map=None):
+    """Create output clients based on current opts.
+
+    Args:
+        opts: Namespace of parsed configuration values.
+        index_prefix_domain_map (dict | None): The parsed
+            ``general.index_prefix_domain_map``. ``None`` -- the default --
+            means multi-tenant prefixing is not configured, so Elasticsearch
+            and OpenSearch index migrations target only the names derived
+            from ``index_prefix``/``index_suffix``.
+
+    Returns:
+        dict of client instances keyed by name.
+
+    Raises:
+        ConfigurationError: If a required output client cannot be created.
+    """
+    clients = {}
+
+    try:
+        if opts.s3_bucket:
+            logger.debug("Initializing S3 client: bucket=%s", opts.s3_bucket)
+            clients["s3_client"] = s3.S3Client(
+                bucket_name=opts.s3_bucket,
+                bucket_path=opts.s3_path,
+                region_name=opts.s3_region_name,
+                endpoint_url=opts.s3_endpoint_url,
+                access_key_id=opts.s3_access_key_id,
+                secret_access_key=opts.s3_secret_access_key,
+            )
+    except Exception as e:
+        raise RuntimeError(f"S3: {e}") from e
+
+    try:
+        if opts.postgresql_host or opts.postgresql_connection_string:
+            logger.debug("Initializing PostgreSQL client")
+            pg_client = postgres.PostgreSQLClient(
+                connection_string=opts.postgresql_connection_string,
+                host=opts.postgresql_host,
+                port=int(opts.postgresql_port or 5432),
+                user=opts.postgresql_user,
+                password=opts.postgresql_password,
+                database=opts.postgresql_database,
+            )
+            pg_client.create_tables()
+            clients["postgresql_client"] = pg_client
+    except Exception as e:
+        raise RuntimeError(f"PostgreSQL: {e}") from e
+
+    try:
+        if opts.syslog_server:
+            logger.debug(
+                "Initializing syslog client: server=%s:%s",
+                opts.syslog_server,
+                opts.syslog_port,
+            )
+            clients["syslog_client"] = syslog.SyslogClient(
+                server_name=opts.syslog_server,
+                server_port=int(opts.syslog_port),
+                protocol=opts.syslog_protocol or "udp",
+                cafile_path=opts.syslog_cafile_path,
+                certfile_path=opts.syslog_certfile_path,
+                keyfile_path=opts.syslog_keyfile_path,
+                timeout=opts.syslog_timeout if opts.syslog_timeout is not None else 5.0,
+                retry_attempts=opts.syslog_retry_attempts
+                if opts.syslog_retry_attempts is not None
+                else 3,
+                retry_delay=opts.syslog_retry_delay
+                if opts.syslog_retry_delay is not None
+                else 5,
+            )
+    except Exception as e:
+        raise RuntimeError(f"Syslog: {e}") from e
+
+    if opts.hec:
+        if opts.hec_token is None or opts.hec_index is None:
+            raise ConfigurationError(
+                "HEC token and HEC index are required when using HEC URL"
+            )
+        try:
+            logger.debug("Initializing Splunk HEC client: url=%s", opts.hec)
+            verify = True
+            if opts.hec_skip_certificate_verification:
+                verify = False
+            clients["hec_client"] = splunk.HECClient(
+                opts.hec, opts.hec_token, opts.hec_index, verify=verify
+            )
+        except Exception as e:
+            raise RuntimeError(f"Splunk HEC: {e}") from e
+
+    try:
+        if opts.kafka_hosts:
+            logger.debug("Initializing Kafka client: hosts=%s", opts.kafka_hosts)
+            ssl_context = None
+            if opts.kafka_skip_certificate_verification:
+                logger.debug("Skipping Kafka certificate verification")
+                ssl_context = create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = CERT_NONE
+            clients["kafka_client"] = kafkaclient.KafkaClient(
+                opts.kafka_hosts,
+                username=opts.kafka_username,
+                password=opts.kafka_password,
+                ssl_context=ssl_context,
+            )
+    except Exception as e:
+        raise RuntimeError(f"Kafka: {e}") from e
+
+    try:
+        if opts.gelf_host:
+            logger.debug(
+                "Initializing GELF client: host=%s:%s",
+                opts.gelf_host,
+                opts.gelf_port,
+            )
+            clients["gelf_client"] = gelf.GelfClient(
+                host=opts.gelf_host,
+                port=int(opts.gelf_port),
+                mode=opts.gelf_mode,
+            )
+    except Exception as e:
+        raise RuntimeError(f"GELF: {e}") from e
+
+    try:
+        if (
+            opts.webhook_aggregate_url
+            or opts.webhook_failure_url
+            or opts.webhook_smtp_tls_url
+        ):
+            logger.debug("Initializing webhook client")
+            clients["webhook_client"] = webhook.WebhookClient(
+                aggregate_url=opts.webhook_aggregate_url,
+                failure_url=opts.webhook_failure_url,
+                smtp_tls_url=opts.webhook_smtp_tls_url,
+                timeout=opts.webhook_timeout,
+            )
+    except Exception as e:
+        raise RuntimeError(f"Webhook: {e}") from e
+
+    # Elasticsearch and OpenSearch mutate module-level global state via
+    # connections.create_connection(), which cannot be rolled back if a later
+    # step fails.  Initialise them last so that all other clients are created
+    # successfully first; this minimizes the window for partial-init problems
+    # during config reload.
+    if opts.save_aggregate or opts.save_failure or opts.save_smtp_tls:
+        try:
+            if opts.elasticsearch_hosts:
+                logger.debug(
+                    "Initializing Elasticsearch client: hosts=%s, ssl=%s",
+                    opts.elasticsearch_hosts,
+                    opts.elasticsearch_ssl,
+                )
+                es_aggregate_indexes = _migration_index_names(
+                    "dmarc_aggregate",
+                    opts.elasticsearch_index_suffix,
+                    opts.elasticsearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                es_failure_indexes = _migration_index_names(
+                    "dmarc_failure",
+                    opts.elasticsearch_index_suffix,
+                    opts.elasticsearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                es_smtp_tls_indexes = _migration_index_names(
+                    "smtp_tls",
+                    opts.elasticsearch_index_suffix,
+                    opts.elasticsearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                # The legacy published_policy.fo migration gets the same
+                # names minus the tenant fan-out: index_prefix_domain_map
+                # arrived in 8.19.0, long after 5.0.0 fixed the mapping, so
+                # no index it names can carry the old one.
+                es_legacy_fo_indexes = _migration_index_names(
+                    "dmarc_aggregate",
+                    opts.elasticsearch_index_suffix,
+                    opts.elasticsearch_index_prefix,
+                    None,
+                )
+                elastic_timeout_value = (
+                    float(opts.elasticsearch_timeout)
+                    if opts.elasticsearch_timeout is not None
+                    else 60.0
+                )
+                elastic.set_hosts(
+                    opts.elasticsearch_hosts,
+                    use_ssl=opts.elasticsearch_ssl,
+                    ssl_cert_path=opts.elasticsearch_ssl_cert_path,
+                    skip_certificate_verification=opts.elasticsearch_skip_certificate_verification,
+                    username=opts.elasticsearch_username,
+                    password=opts.elasticsearch_password,
+                    api_key=opts.elasticsearch_api_key,
+                    timeout=elastic_timeout_value,
+                    serverless=opts.elasticsearch_serverless,
+                )
+                logger.debug(
+                    "Elasticsearch index migration targets: aggregate=%s, "
+                    "failure=%s, smtp_tls=%s, legacy_fo=%s",
+                    es_aggregate_indexes,
+                    es_failure_indexes,
+                    es_smtp_tls_indexes,
+                    es_legacy_fo_indexes,
+                )
+                elastic.migrate_indexes(
+                    aggregate_indexes=es_aggregate_indexes,
+                    failure_indexes=es_failure_indexes,
+                    smtp_tls_indexes=es_smtp_tls_indexes,
+                    legacy_fo_indexes=es_legacy_fo_indexes,
+                )
+                clients["elasticsearch"] = _ElasticsearchHandle()
+        except Exception as e:
+            raise RuntimeError(f"Elasticsearch: {e}") from e
+
+        try:
+            if opts.opensearch_hosts:
+                logger.debug(
+                    "Initializing OpenSearch client: hosts=%s, ssl=%s",
+                    opts.opensearch_hosts,
+                    opts.opensearch_ssl,
+                )
+                os_aggregate_indexes = _migration_index_names(
+                    "dmarc_aggregate",
+                    opts.opensearch_index_suffix,
+                    opts.opensearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                os_failure_indexes = _migration_index_names(
+                    "dmarc_failure",
+                    opts.opensearch_index_suffix,
+                    opts.opensearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                os_smtp_tls_indexes = _migration_index_names(
+                    "smtp_tls",
+                    opts.opensearch_index_suffix,
+                    opts.opensearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                # The legacy published_policy.fo migration gets the same
+                # names minus the tenant fan-out: index_prefix_domain_map
+                # arrived in 8.19.0, long after 5.0.0 fixed the mapping, so
+                # no index it names can carry the old one.
+                os_legacy_fo_indexes = _migration_index_names(
+                    "dmarc_aggregate",
+                    opts.opensearch_index_suffix,
+                    opts.opensearch_index_prefix,
+                    None,
+                )
+                opensearch_timeout_value = (
+                    float(opts.opensearch_timeout)
+                    if opts.opensearch_timeout is not None
+                    else 60.0
+                )
+                opensearch.set_hosts(
+                    opts.opensearch_hosts,
+                    use_ssl=opts.opensearch_ssl,
+                    ssl_cert_path=opts.opensearch_ssl_cert_path,
+                    skip_certificate_verification=opts.opensearch_skip_certificate_verification,
+                    username=opts.opensearch_username,
+                    password=opts.opensearch_password,
+                    api_key=opts.opensearch_api_key,
+                    timeout=opensearch_timeout_value,
+                    auth_type=opts.opensearch_auth_type,
+                    aws_region=opts.opensearch_aws_region,
+                    aws_service=opts.opensearch_aws_service,
+                )
+                logger.debug(
+                    "OpenSearch index migration targets: aggregate=%s, "
+                    "failure=%s, smtp_tls=%s, legacy_fo=%s",
+                    os_aggregate_indexes,
+                    os_failure_indexes,
+                    os_smtp_tls_indexes,
+                    os_legacy_fo_indexes,
+                )
+                opensearch.migrate_indexes(
+                    aggregate_indexes=os_aggregate_indexes,
+                    failure_indexes=os_failure_indexes,
+                    smtp_tls_indexes=os_smtp_tls_indexes,
+                    legacy_fo_indexes=os_legacy_fo_indexes,
+                )
+                clients["opensearch"] = _OpenSearchHandle()
+        except Exception as e:
+            raise RuntimeError(f"OpenSearch: {e}") from e
+
+    return clients
+
+
+def _close_output_clients(clients):
+    """Close output clients that hold persistent connections.
+
+    Clients that do not expose a ``close`` method are silently skipped.
+    Errors during closing are logged as warnings and do not propagate.
+    Idempotent: each client is popped as it is closed, so a second call
+    (e.g. the trailing close plus the atexit safety net) is a no-op.
+
+    Args:
+        clients: dict of client instances returned by :func:`_init_output_clients`.
+    """
+    while clients:
+        name, client = clients.popitem()
+        if hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                logger.warning("Error closing %s", name, exc_info=True)
+
+
+def _build_parser_config(opts: Namespace) -> ParserConfig:
+    """Builds the single ParserConfig for this run from parsed opts, bound to
+    the process-wide default caches (the parsedmarc module globals).
+    """
+    return ParserConfig(
+        offline=opts.offline,
+        ip_db_path=opts.ip_db_path,
+        always_use_local_files=opts.always_use_local_files,
+        reverse_dns_map_path=opts.reverse_dns_map_path,
+        reverse_dns_map_url=opts.reverse_dns_map_url,
+        psl_overrides_path=opts.psl_overrides_path,
+        psl_overrides_url=opts.psl_overrides_url,
+        nameservers=opts.nameservers,
+        dns_timeout=(
+            float(opts.dns_timeout)
+            if opts.dns_timeout is not None
+            else DEFAULT_DNS_TIMEOUT
+        ),
+        dns_retries=(
+            int(opts.dns_retries)
+            if opts.dns_retries is not None
+            else DEFAULT_DNS_MAX_RETRIES
+        ),
+        strip_attachment_payloads=opts.strip_attachment_payloads,
+        normalize_timespan_threshold_hours=(
+            float(opts.normalize_timespan_threshold_hours)
+            if opts.normalize_timespan_threshold_hours is not None
+            else 24.0
+        ),
+        ip_address_cache=IP_ADDRESS_CACHE,
+        seen_aggregate_report_ids=SEEN_AGGREGATE_REPORT_IDS,
+        reverse_dns_map=REVERSE_DNS_MAP,
+    )
 
 
 def _main():
     """Called when the module is executed"""
 
+    def get_index_prefix(report):
+        domain = None
+        if index_prefix_domain_map is None:
+            return None
+        if "policy_published" in report:
+            domain = report["policy_published"]["domain"]
+        elif "reported_domain" in report:
+            domain = report["reported_domain"]
+        elif report.get("policies"):
+            # Guarded with .get() truthiness: parse_smtp_tls_report_json()
+            # accepts a report whose policies list is empty, which would
+            # make [0] raise IndexError here. Such a report has no domain
+            # to map, so it falls through to return None like any other
+            # unmappable report.
+            domain = report["policies"][0]["policy_domain"]
+        if domain:
+            domain = get_base_domain(domain)
+            if domain:
+                domain = domain.lower()
+                for key in index_prefix_domain_map:
+                    if domain in index_prefix_domain_map[key]:
+                        return _normalize_index_prefix(key)
+        return None
+
+    def filter_smtp_tls_reports_for_index_prefix(tls_reports):
+        """Drop SMTP TLS reports whose domain isn't covered by
+        ``index_prefix_domain_map``.
+
+        Shared by ``process_reports()`` (which filters each batch it saves)
+        and by the combined ``parsing_results`` that feeds
+        ``email_results()``. Mailbox batches are saved inside
+        ``get_dmarc_reports_from_mailbox()``, so the dicts
+        ``process_reports()`` filters in place are no longer the same
+        objects as the combined results assembled afterward -- without this,
+        the emailed summary would list SMTP TLS reports that were
+        deliberately excluded from every output destination.
+        """
+        if index_prefix_domain_map is None:
+            return tls_reports
+        filtered_tls = []
+        for report in tls_reports:
+            if get_index_prefix(report) is not None:
+                filtered_tls.append(report)
+            else:
+                domain = "unknown"
+                if "policies" in report and report["policies"]:
+                    domain = report["policies"][0].get("policy_domain", "unknown")
+                logger.debug(
+                    "Ignoring SMTP TLS report for domain not in "
+                    "index_prefix_domain_map: %s",
+                    domain,
+                )
+        return filtered_tls
+
     def process_reports(reports_):
-        """Processes and saves the parsed reports"""
-        logger.info(
-            "Processing %d aggregate, %d forensic, and %d SMTP TLS reports",
-            len(reports_["aggregate_reports"]),
-            len(reports_["forensic_reports"]),
-            len(reports_["smtp_tls_reports"]),
+        """Write ``reports_`` to every configured output destination.
+
+        Returns the list of human-readable output-error messages recorded
+        along the way -- empty when every destination accepted the reports.
+        Callers use that as the "was this batch saved?" signal; see
+        ``mailbox_save_callback()``.
+        """
+        output_errors = []
+
+        def log_output_error(destination, error):
+            message = f"{destination} Error: {error}"
+            logger.error(message)
+            output_errors.append(message)
+
+        if index_prefix_domain_map is not None:
+            reports_["smtp_tls_reports"] = filter_smtp_tls_reports_for_index_prefix(
+                reports_.get("smtp_tls_reports", [])
+            )
+
+        indent_value = 2 if opts.prettify_json else None
+        output_str = (
+            f"{json.dumps(reports_, ensure_ascii=False, indent=indent_value)}\n"
         )
-        output_str = "{0}\n".format(json.dumps(reports_, ensure_ascii=False, indent=2))
 
         if not opts.silent:
             print(output_str)
         if opts.output:
-            logger.info("Saving report files to %s", opts.output)
-            save_output(
-                results,
-                output_directory=opts.output,
-                aggregate_json_filename=opts.aggregate_json_filename,
-                forensic_json_filename=opts.forensic_json_filename,
-                smtp_tls_json_filename=opts.smtp_tls_json_filename,
-                aggregate_csv_filename=opts.aggregate_csv_filename,
-                forensic_csv_filename=opts.forensic_csv_filename,
-                smtp_tls_csv_filename=opts.smtp_tls_csv_filename,
-            )
+            try:
+                save_output(
+                    reports_,
+                    output_directory=opts.output,
+                    aggregate_json_filename=opts.aggregate_json_filename,
+                    failure_json_filename=opts.failure_json_filename,
+                    smtp_tls_json_filename=opts.smtp_tls_json_filename,
+                    aggregate_csv_filename=opts.aggregate_csv_filename,
+                    failure_csv_filename=opts.failure_csv_filename,
+                    smtp_tls_csv_filename=opts.smtp_tls_csv_filename,
+                )
+            except (OSError, ValueError) as error_:
+                # The only output destination that was not already caught:
+                # a full disk or an unwritable directory used to crash the
+                # run outright, and now that a failed save holds mailbox
+                # messages back it also has to be recorded like any other
+                # destination's failure rather than escaping.
+                log_output_error("File output", str(error_))
+
+        kafka_client = clients.get("kafka_client")
+        s3_client = clients.get("s3_client")
+        syslog_client = clients.get("syslog_client")
+        hec_client = clients.get("hec_client")
+        gelf_client = clients.get("gelf_client")
+        webhook_client = clients.get("webhook_client")
+        pg_client = clients.get("postgresql_client")
+
+        kafka_aggregate_topic = opts.kafka_aggregate_topic
+        kafka_failure_topic = opts.kafka_failure_topic
+        kafka_smtp_tls_topic = opts.kafka_smtp_tls_topic
+
         if opts.save_aggregate:
-            logger.info("Saving aggregate reports...")
             for report in reports_["aggregate_reports"]:
                 try:
                     if opts.elasticsearch_hosts:
@@ -135,7 +2013,8 @@ def _main():
                         elastic.save_aggregate_report_to_elasticsearch(
                             report,
                             index_suffix=opts.elasticsearch_index_suffix,
-                            index_prefix=opts.elasticsearch_index_prefix,
+                            index_prefix=opts.elasticsearch_index_prefix
+                            or get_index_prefix(report),
                             monthly_indexes=opts.elasticsearch_monthly_indexes,
                             number_of_shards=shards,
                             number_of_replicas=replicas,
@@ -143,11 +2022,9 @@ def _main():
                 except elastic.AlreadySaved as warning:
                     logger.warning(warning.__str__())
                 except elastic.ElasticsearchError as error_:
-                    logger.error("Elasticsearch Error: {0}".format(error_.__str__()))
+                    log_output_error("Elasticsearch", error_.__str__())
                 except Exception as error_:
-                    logger.error(
-                        "Elasticsearch exception error: {}".format(error_.__str__())
-                    )
+                    log_output_error("Elasticsearch exception", error_.__str__())
 
                 try:
                     if opts.opensearch_hosts:
@@ -156,7 +2033,8 @@ def _main():
                         opensearch.save_aggregate_report_to_opensearch(
                             report,
                             index_suffix=opts.opensearch_index_suffix,
-                            index_prefix=opts.opensearch_index_prefix,
+                            index_prefix=opts.opensearch_index_prefix
+                            or get_index_prefix(report),
                             monthly_indexes=opts.opensearch_monthly_indexes,
                             number_of_shards=shards,
                             number_of_replicas=replicas,
@@ -164,66 +2042,72 @@ def _main():
                 except opensearch.AlreadySaved as warning:
                     logger.warning(warning.__str__())
                 except opensearch.OpenSearchError as error_:
-                    logger.error("OpenSearch Error: {0}".format(error_.__str__()))
+                    log_output_error("OpenSearch", error_.__str__())
                 except Exception as error_:
-                    logger.error(
-                        "OpenSearch exception error: {}".format(error_.__str__())
-                    )
+                    log_output_error("OpenSearch exception", error_.__str__())
 
                 try:
-                    if opts.kafka_hosts:
+                    if kafka_client:
                         kafka_client.save_aggregate_reports_to_kafka(
                             report, kafka_aggregate_topic
                         )
                 except Exception as error_:
-                    logger.error("Kafka Error: {0}".format(error_.__str__()))
+                    log_output_error("Kafka", error_.__str__())
 
                 try:
-                    if opts.s3_bucket:
+                    if s3_client:
                         s3_client.save_aggregate_report_to_s3(report)
                 except Exception as error_:
-                    logger.error("S3 Error: {0}".format(error_.__str__()))
+                    log_output_error("S3", error_.__str__())
 
                 try:
-                    if opts.syslog_server:
+                    if pg_client:
+                        pg_client.save_aggregate_report_to_postgresql(report)
+                except postgres.AlreadySaved as warning:
+                    logger.warning(warning.__str__())
+                except postgres.PostgreSQLError as error_:
+                    log_output_error("PostgreSQL", error_.__str__())
+
+                try:
+                    if syslog_client:
                         syslog_client.save_aggregate_report_to_syslog(report)
                 except Exception as error_:
-                    logger.error("Syslog Error: {0}".format(error_.__str__()))
+                    log_output_error("Syslog", error_.__str__())
 
                 try:
-                    if opts.gelf_host:
+                    if gelf_client:
                         gelf_client.save_aggregate_report_to_gelf(report)
                 except Exception as error_:
-                    logger.error("GELF Error: {0}".format(error_.__str__()))
+                    log_output_error("GELF", error_.__str__())
 
                 try:
-                    if opts.webhook_aggregate_url:
+                    if opts.webhook_aggregate_url and webhook_client:
+                        indent_value = 2 if opts.prettify_json else None
                         webhook_client.save_aggregate_report_to_webhook(
-                            json.dumps(report, ensure_ascii=False, indent=2)
+                            json.dumps(report, ensure_ascii=False, indent=indent_value)
                         )
                 except Exception as error_:
-                    logger.error("Webhook Error: {0}".format(error_.__str__()))
+                    log_output_error("Webhook", error_.__str__())
 
-        if opts.hec:
-            try:
-                aggregate_reports_ = reports_["aggregate_reports"]
-                if len(aggregate_reports_) > 0:
-                    logger.info("Saving aggregate reports to Splunk HEC...")
-                    hec_client.save_aggregate_reports_to_splunk(aggregate_reports_)
-            except splunk.SplunkError as e:
-                logger.error("Splunk HEC error: {0}".format(e.__str__()))
+            if hec_client:
+                try:
+                    aggregate_reports_ = reports_["aggregate_reports"]
+                    if len(aggregate_reports_) > 0:
+                        hec_client.save_aggregate_reports_to_splunk(aggregate_reports_)
+                except splunk.SplunkError as e:
+                    log_output_error("Splunk HEC", e.__str__())
 
-        if opts.save_forensic:
-            logger.info("Saving forensic reports...")
-            for report in reports_["forensic_reports"]:
+        if opts.save_failure:
+            for report in reports_["failure_reports"]:
                 try:
                     shards = opts.elasticsearch_number_of_shards
                     replicas = opts.elasticsearch_number_of_replicas
                     if opts.elasticsearch_hosts:
-                        elastic.save_forensic_report_to_elasticsearch(
+                        elastic.save_failure_report_to_elasticsearch(
                             report,
                             index_suffix=opts.elasticsearch_index_suffix,
-                            index_prefix=opts.elasticsearch_index_prefix,
+                            index_prefix=opts.elasticsearch_index_prefix
+                            or get_index_prefix(report),
                             monthly_indexes=opts.elasticsearch_monthly_indexes,
                             number_of_shards=shards,
                             number_of_replicas=replicas,
@@ -231,18 +2115,19 @@ def _main():
                 except elastic.AlreadySaved as warning:
                     logger.warning(warning.__str__())
                 except elastic.ElasticsearchError as error_:
-                    logger.error("Elasticsearch Error: {0}".format(error_.__str__()))
+                    log_output_error("Elasticsearch", error_.__str__())
                 except InvalidDMARCReport as error_:
-                    logger.error(error_.__str__())
+                    log_output_error("Invalid DMARC report", error_.__str__())
 
                 try:
                     shards = opts.opensearch_number_of_shards
                     replicas = opts.opensearch_number_of_replicas
                     if opts.opensearch_hosts:
-                        opensearch.save_forensic_report_to_opensearch(
+                        opensearch.save_failure_report_to_opensearch(
                             report,
                             index_suffix=opts.opensearch_index_suffix,
-                            index_prefix=opts.opensearch_index_prefix,
+                            index_prefix=opts.opensearch_index_prefix
+                            or get_index_prefix(report),
                             monthly_indexes=opts.opensearch_monthly_indexes,
                             number_of_shards=shards,
                             number_of_replicas=replicas,
@@ -250,55 +2135,62 @@ def _main():
                 except opensearch.AlreadySaved as warning:
                     logger.warning(warning.__str__())
                 except opensearch.OpenSearchError as error_:
-                    logger.error("OpenSearch Error: {0}".format(error_.__str__()))
+                    log_output_error("OpenSearch", error_.__str__())
                 except InvalidDMARCReport as error_:
-                    logger.error(error_.__str__())
+                    log_output_error("Invalid DMARC report", error_.__str__())
 
                 try:
-                    if opts.kafka_hosts:
-                        kafka_client.save_forensic_reports_to_kafka(
-                            report, kafka_forensic_topic
+                    if kafka_client:
+                        kafka_client.save_failure_reports_to_kafka(
+                            report, kafka_failure_topic
                         )
                 except Exception as error_:
-                    logger.error("Kafka Error: {0}".format(error_.__str__()))
+                    log_output_error("Kafka", error_.__str__())
 
                 try:
-                    if opts.s3_bucket:
-                        s3_client.save_forensic_report_to_s3(report)
+                    if s3_client:
+                        s3_client.save_failure_report_to_s3(report)
                 except Exception as error_:
-                    logger.error("S3 Error: {0}".format(error_.__str__()))
+                    log_output_error("S3", error_.__str__())
 
                 try:
-                    if opts.syslog_server:
-                        syslog_client.save_forensic_report_to_syslog(report)
+                    if pg_client:
+                        pg_client.save_failure_report_to_postgresql(report)
+                except postgres.AlreadySaved as warning:
+                    logger.warning(warning.__str__())
+                except postgres.PostgreSQLError as error_:
+                    log_output_error("PostgreSQL", error_.__str__())
+
+                try:
+                    if syslog_client:
+                        syslog_client.save_failure_report_to_syslog(report)
                 except Exception as error_:
-                    logger.error("Syslog Error: {0}".format(error_.__str__()))
+                    log_output_error("Syslog", error_.__str__())
 
                 try:
-                    if opts.gelf_host:
-                        gelf_client.save_forensic_report_to_gelf(report)
+                    if gelf_client:
+                        gelf_client.save_failure_report_to_gelf(report)
                 except Exception as error_:
-                    logger.error("GELF Error: {0}".format(error_.__str__()))
+                    log_output_error("GELF", error_.__str__())
 
                 try:
-                    if opts.webhook_forensic_url:
-                        webhook_client.save_forensic_report_to_webhook(
-                            json.dumps(report, ensure_ascii=False, indent=2)
+                    if opts.webhook_failure_url and webhook_client:
+                        indent_value = 2 if opts.prettify_json else None
+                        webhook_client.save_failure_report_to_webhook(
+                            json.dumps(report, ensure_ascii=False, indent=indent_value)
                         )
                 except Exception as error_:
-                    logger.error("Webhook Error: {0}".format(error_.__str__()))
+                    log_output_error("Webhook", error_.__str__())
 
-        if opts.hec:
-            try:
-                forensic_reports_ = reports_["forensic_reports"]
-                if len(forensic_reports_) > 0:
-                    logger.info("Saving forensic reports to Splunk HEC...")
-                    hec_client.save_forensic_reports_to_splunk(forensic_reports_)
-            except splunk.SplunkError as e:
-                logger.error("Splunk HEC error: {0}".format(e.__str__()))
+            if hec_client:
+                try:
+                    failure_reports_ = reports_["failure_reports"]
+                    if len(failure_reports_) > 0:
+                        hec_client.save_failure_reports_to_splunk(failure_reports_)
+                except splunk.SplunkError as e:
+                    log_output_error("Splunk HEC", e.__str__())
 
         if opts.save_smtp_tls:
-            logger.info("Saving SMTP TLS reports...")
             for report in reports_["smtp_tls_reports"]:
                 try:
                     shards = opts.elasticsearch_number_of_shards
@@ -307,7 +2199,8 @@ def _main():
                         elastic.save_smtp_tls_report_to_elasticsearch(
                             report,
                             index_suffix=opts.elasticsearch_index_suffix,
-                            index_prefix=opts.elasticsearch_index_prefix,
+                            index_prefix=opts.elasticsearch_index_prefix
+                            or get_index_prefix(report),
                             monthly_indexes=opts.elasticsearch_monthly_indexes,
                             number_of_shards=shards,
                             number_of_replicas=replicas,
@@ -315,9 +2208,9 @@ def _main():
                 except elastic.AlreadySaved as warning:
                     logger.warning(warning.__str__())
                 except elastic.ElasticsearchError as error_:
-                    logger.error("Elasticsearch Error: {0}".format(error_.__str__()))
+                    log_output_error("Elasticsearch", error_.__str__())
                 except InvalidDMARCReport as error_:
-                    logger.error(error_.__str__())
+                    log_output_error("Invalid DMARC report", error_.__str__())
 
                 try:
                     shards = opts.opensearch_number_of_shards
@@ -326,7 +2219,8 @@ def _main():
                         opensearch.save_smtp_tls_report_to_opensearch(
                             report,
                             index_suffix=opts.opensearch_index_suffix,
-                            index_prefix=opts.opensearch_index_prefix,
+                            index_prefix=opts.opensearch_index_prefix
+                            or get_index_prefix(report),
                             monthly_indexes=opts.opensearch_monthly_indexes,
                             number_of_shards=shards,
                             number_of_replicas=replicas,
@@ -334,55 +2228,62 @@ def _main():
                 except opensearch.AlreadySaved as warning:
                     logger.warning(warning.__str__())
                 except opensearch.OpenSearchError as error_:
-                    logger.error("OpenSearch Error: {0}".format(error_.__str__()))
+                    log_output_error("OpenSearch", error_.__str__())
                 except InvalidDMARCReport as error_:
-                    logger.error(error_.__str__())
+                    log_output_error("Invalid DMARC report", error_.__str__())
 
                 try:
-                    if opts.kafka_hosts:
+                    if kafka_client:
                         kafka_client.save_smtp_tls_reports_to_kafka(
-                            smtp_tls_reports, kafka_smtp_tls_topic
+                            [report], kafka_smtp_tls_topic
                         )
                 except Exception as error_:
-                    logger.error("Kafka Error: {0}".format(error_.__str__()))
+                    log_output_error("Kafka", error_.__str__())
 
                 try:
-                    if opts.s3_bucket:
+                    if s3_client:
                         s3_client.save_smtp_tls_report_to_s3(report)
                 except Exception as error_:
-                    logger.error("S3 Error: {0}".format(error_.__str__()))
+                    log_output_error("S3", error_.__str__())
 
                 try:
-                    if opts.syslog_server:
+                    if pg_client:
+                        pg_client.save_smtp_tls_report_to_postgresql(report)
+                except postgres.AlreadySaved as warning:
+                    logger.warning(warning.__str__())
+                except postgres.PostgreSQLError as error_:
+                    log_output_error("PostgreSQL", error_.__str__())
+
+                try:
+                    if syslog_client:
                         syslog_client.save_smtp_tls_report_to_syslog(report)
                 except Exception as error_:
-                    logger.error("Syslog Error: {0}".format(error_.__str__()))
+                    log_output_error("Syslog", error_.__str__())
 
                 try:
-                    if opts.gelf_host:
+                    if gelf_client:
                         gelf_client.save_smtp_tls_report_to_gelf(report)
                 except Exception as error_:
-                    logger.error("GELF Error: {0}".format(error_.__str__()))
+                    log_output_error("GELF", error_.__str__())
 
                 try:
-                    if opts.webhook_smtp_tls_url:
+                    if opts.webhook_smtp_tls_url and webhook_client:
+                        indent_value = 2 if opts.prettify_json else None
                         webhook_client.save_smtp_tls_report_to_webhook(
-                            json.dumps(report, ensure_ascii=False, indent=2)
+                            json.dumps(report, ensure_ascii=False, indent=indent_value)
                         )
                 except Exception as error_:
-                    logger.error("Webhook Error: {0}".format(error_.__str__()))
+                    log_output_error("Webhook", error_.__str__())
 
-        if opts.hec:
-            try:
-                smtp_tls_reports_ = reports_["smtp_tls_reports"]
-                if len(smtp_tls_reports_) > 0:
-                    logger.info("Saving SMTP TLS reports to Splunk HEC...")
-                    hec_client.save_smtp_tls_reports_to_splunk(smtp_tls_reports_)
-            except splunk.SplunkError as e:
-                logger.error("Splunk HEC error: {0}".format(e.__str__()))
+            if hec_client:
+                try:
+                    smtp_tls_reports_ = reports_["smtp_tls_reports"]
+                    if len(smtp_tls_reports_) > 0:
+                        hec_client.save_smtp_tls_reports_to_splunk(smtp_tls_reports_)
+                except splunk.SplunkError as e:
+                    log_output_error("Splunk HEC", e.__str__())
 
         if opts.la_dce:
-            logger.info("Saving reports to Log Analytics...")
             try:
                 la_client = loganalytics.LogAnalyticsClient(
                     client_id=opts.la_client_id,
@@ -391,24 +2292,28 @@ def _main():
                     dce=opts.la_dce,
                     dcr_immutable_id=opts.la_dcr_immutable_id,
                     dcr_aggregate_stream=opts.la_dcr_aggregate_stream,
-                    dcr_forensic_stream=opts.la_dcr_forensic_stream,
+                    dcr_failure_stream=opts.la_dcr_failure_stream,
                     dcr_smtp_tls_stream=opts.la_dcr_smtp_tls_stream,
                 )
                 la_client.publish_results(
                     reports_,
                     opts.save_aggregate,
-                    opts.save_forensic,
+                    opts.save_failure,
                     opts.save_smtp_tls,
                 )
             except loganalytics.LogAnalyticsException as e:
-                logger.error("Log Analytics error: {0}".format(e.__str__()))
+                log_output_error("Log Analytics", e.__str__())
             except Exception as e:
-                logger.error(
-                    "Unknown error occurred"
-                    + " during the publishing"
-                    + " to Log Analytics: "
-                    + e.__str__()
+                log_output_error("Log Analytics", f"Unknown publishing error: {e}")
+
+        if opts.fail_on_output_error and output_errors:
+            raise ParserError(
+                "Output destination failures detected: {}".format(
+                    " | ".join(output_errors)
                 )
+            )
+
+        return output_errors
 
     arg_parser = ArgumentParser(description="Parses DMARC reports")
     arg_parser.add_argument(
@@ -419,10 +2324,17 @@ def _main():
     arg_parser.add_argument(
         "file_path",
         nargs="*",
-        help="one or more paths to aggregate or forensic "
-        "report files, emails, or mbox files'",
+        help="one or more paths to aggregate or failure report files, "
+        "emails, mbox files, or directories containing them",
     )
-    strip_attachment_help = "remove attachment payloads from forensic report output"
+    arg_parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="search directories given as file_path recursively, and "
+        "enable '**' recursion in glob patterns",
+    )
+    strip_attachment_help = "remove attachment payloads from failure report output"
     arg_parser.add_argument(
         "--strip-attachment-payloads", help=strip_attachment_help, action="store_true"
     )
@@ -435,9 +2347,9 @@ def _main():
         default="aggregate.json",
     )
     arg_parser.add_argument(
-        "--forensic-json-filename",
-        help="filename for the forensic JSON output file",
-        default="forensic.json",
+        "--failure-json-filename",
+        help="filename for the failure JSON output file",
+        default="failure.json",
     )
     arg_parser.add_argument(
         "--smtp-tls-json-filename",
@@ -450,9 +2362,9 @@ def _main():
         default="aggregate.csv",
     )
     arg_parser.add_argument(
-        "--forensic-csv-filename",
-        help="filename for the forensic CSV output file",
-        default="forensic.csv",
+        "--failure-csv-filename",
+        help="filename for the failure CSV output file",
+        default="failure.csv",
     )
     arg_parser.add_argument(
         "--smtp-tls-csv-filename",
@@ -468,6 +2380,14 @@ def _main():
         help="number of seconds to wait for an answer from DNS (default: 2.0)",
         type=float,
         default=2.0,
+    )
+    arg_parser.add_argument(
+        "--dns-retries",
+        dest="dns_retries",
+        help="number of times to retry DNS queries on timeout or other "
+        "transient errors (default: 0)",
+        type=int,
+        default=0,
     )
     arg_parser.add_argument(
         "--offline",
@@ -490,15 +2410,19 @@ def _main():
         "--debug", action="store_true", help="print debugging information"
     )
     arg_parser.add_argument("--log-file", default=None, help="output logging to a file")
+    arg_parser.add_argument(
+        "--no-prettify-json",
+        action="store_false",
+        dest="prettify_json",
+        help="output JSON in a single line without indentation",
+    )
     arg_parser.add_argument("-v", "--version", action="version", version=__version__)
 
     aggregate_reports = []
-    forensic_reports = []
+    failure_reports = []
     smtp_tls_reports = []
 
     args = arg_parser.parse_args()
-
-    default_gmail_api_scope = "https://www.googleapis.com/auth/gmail.modify"
 
     opts = Namespace(
         file_path=args.file_path,
@@ -508,8 +2432,8 @@ def _main():
         output=args.output,
         aggregate_csv_filename=args.aggregate_csv_filename,
         aggregate_json_filename=args.aggregate_json_filename,
-        forensic_csv_filename=args.forensic_csv_filename,
-        forensic_json_filename=args.forensic_json_filename,
+        failure_csv_filename=args.failure_csv_filename,
+        failure_json_filename=args.failure_json_filename,
         smtp_tls_json_filename=args.smtp_tls_json_filename,
         smtp_tls_csv_filename=args.smtp_tls_csv_filename,
         nameservers=args.nameservers,
@@ -517,18 +2441,28 @@ def _main():
         silent=args.silent,
         warnings=args.warnings,
         dns_timeout=args.dns_timeout,
+        dns_retries=args.dns_retries,
         debug=args.debug,
         verbose=args.verbose,
+        prettify_json=args.prettify_json,
         save_aggregate=False,
-        save_forensic=False,
+        save_failure=False,
         save_smtp_tls=False,
         mailbox_reports_folder="INBOX",
         mailbox_archive_folder="Archive",
         mailbox_watch=False,
         mailbox_delete=False,
+        # None means "unset": each per-report-type flag inherits mailbox_delete
+        # in get_dmarc_reports_from_mailbox, so an explicit False (opting one
+        # type out of a global delete = true) stays distinct from being unset.
+        mailbox_delete_aggregate=None,
+        mailbox_delete_failure=None,
+        mailbox_delete_smtp_tls=None,
+        mailbox_delete_invalid=None,
         mailbox_test=False,
         mailbox_batch_size=10,
         mailbox_check_timeout=30,
+        mailbox_max_unsaved_retries=2,
         mailbox_since=None,
         imap_host=None,
         imap_skip_certificate_verification=False,
@@ -543,6 +2477,9 @@ def _main():
         graph_password=None,
         graph_client_id=None,
         graph_client_secret=None,
+        graph_certificate_path=None,
+        graph_certificate_password=None,
+        graph_client_assertion=None,
         graph_tenant_id=None,
         graph_mailbox=None,
         graph_allow_unencrypted_storage=False,
@@ -559,10 +2496,12 @@ def _main():
         elasticsearch_index_prefix=None,
         elasticsearch_ssl=True,
         elasticsearch_ssl_cert_path=None,
+        elasticsearch_skip_certificate_verification=False,
         elasticsearch_monthly_indexes=False,
         elasticsearch_username=None,
         elasticsearch_password=None,
-        elasticsearch_apiKey=None,
+        elasticsearch_api_key=None,
+        elasticsearch_serverless=False,
         opensearch_hosts=None,
         opensearch_timeout=60,
         opensearch_number_of_shards=1,
@@ -571,15 +2510,19 @@ def _main():
         opensearch_index_prefix=None,
         opensearch_ssl=True,
         opensearch_ssl_cert_path=None,
+        opensearch_skip_certificate_verification=False,
         opensearch_monthly_indexes=False,
         opensearch_username=None,
         opensearch_password=None,
-        opensearch_apiKey=None,
+        opensearch_api_key=None,
+        opensearch_auth_type="basic",
+        opensearch_aws_region=None,
+        opensearch_aws_service="es",
         kafka_hosts=None,
         kafka_username=None,
         kafka_password=None,
         kafka_aggregate_topic=None,
-        kafka_forensic_topic=None,
+        kafka_failure_topic=None,
         kafka_smtp_tls_topic=None,
         kafka_ssl=False,
         kafka_skip_certificate_verification=False,
@@ -592,6 +2535,7 @@ def _main():
         smtp_from=None,
         smtp_to=[],
         smtp_subject="parsedmarc report",
+        smtp_attachment=None,
         smtp_message="Please see the attached DMARC results.",
         s3_bucket=None,
         s3_path=None,
@@ -601,593 +2545,79 @@ def _main():
         s3_secret_access_key=None,
         syslog_server=None,
         syslog_port=None,
+        syslog_protocol=None,
+        syslog_cafile_path=None,
+        syslog_certfile_path=None,
+        syslog_keyfile_path=None,
+        syslog_timeout=None,
+        syslog_retry_attempts=None,
+        syslog_retry_delay=None,
         gmail_api_credentials_file=None,
         gmail_api_token_file=None,
-        gmail_api_service_account_file=None, # Add this
-        gmail_api_delegated_account=None,   # Add this
         gmail_api_include_spam_trash=False,
         gmail_api_paginate_messages=True,
         gmail_api_scopes=[],
         gmail_api_oauth2_port=8080,
+        gmail_api_auth_mode="installed_app",
+        gmail_api_service_account_user=None,
         maildir_path=None,
         maildir_create=False,
         log_file=args.log_file,
         n_procs=1,
+        archive_directory=None,
         ip_db_path=None,
+        ipinfo_url=None,
+        ipinfo_api_token=None,
         always_use_local_files=False,
         reverse_dns_map_path=None,
         reverse_dns_map_url=None,
+        psl_overrides_path=None,
+        psl_overrides_url=None,
         la_client_id=None,
         la_client_secret=None,
         la_tenant_id=None,
         la_dce=None,
         la_dcr_immutable_id=None,
         la_dcr_aggregate_stream=None,
-        la_dcr_forensic_stream=None,
+        la_dcr_failure_stream=None,
         la_dcr_smtp_tls_stream=None,
         gelf_host=None,
         gelf_port=None,
         gelf_mode=None,
         webhook_aggregate_url=None,
-        webhook_forensic_url=None,
+        webhook_failure_url=None,
         webhook_smtp_tls_url=None,
         webhook_timeout=60,
+        normalize_timespan_threshold_hours=24.0,
+        postgresql_host=None,
+        postgresql_port=5432,
+        postgresql_user=None,
+        postgresql_password=None,
+        postgresql_database=None,
+        postgresql_connection_string=None,
+        fail_on_output_error=False,
     )
-    args = arg_parser.parse_args()
 
-    if args.config_file:
-        abs_path = os.path.abspath(args.config_file)
-        if not os.path.exists(abs_path):
-            logger.error("A file does not exist at {0}".format(abs_path))
+    # Snapshot opts as set from CLI args / hardcoded defaults, before any config
+    # file is applied. On each SIGHUP reload we restore this baseline first so
+    # that sections removed from the config file actually take effect.
+    opts_from_cli = Namespace(**vars(opts))
+
+    index_prefix_domain_map = None
+
+    config_file = args.config_file or os.environ.get("PARSEDMARC_CONFIG_FILE")
+    has_env_config = any(
+        k.startswith("PARSEDMARC_") and k != "PARSEDMARC_CONFIG_FILE"
+        for k in os.environ
+    )
+
+    if config_file or has_env_config:
+        try:
+            config = _load_config(config_file)
+            index_prefix_domain_map = _parse_config(config, opts)
+        except ConfigurationError as e:
+            logger.critical(str(e))
             exit(-1)
-        logger.info("Loading configuration from %s", abs_path)
-        opts.silent = True
-        config = ConfigParser()
-        config.read(args.config_file)
-        if "general" in config.sections():
-            general_config = config["general"]
-            if "offline" in general_config:
-                opts.offline = general_config.getboolean("offline")
-            if "strip_attachment_payloads" in general_config:
-                opts.strip_attachment_payloads = general_config.getboolean(
-                    "strip_attachment_payloads"
-                )
-            if "output" in general_config:
-                opts.output = general_config["output"]
-            if "aggregate_json_filename" in general_config:
-                opts.aggregate_json_filename = general_config["aggregate_json_filename"]
-            if "forensic_json_filename" in general_config:
-                opts.forensic_json_filename = general_config["forensic_json_filename"]
-            if "smtp_tls_json_filename" in general_config:
-                opts.smtp_tls_json_filename = general_config["smtp_tls_json_filename"]
-            if "aggregate_csv_filename" in general_config:
-                opts.aggregate_csv_filename = general_config["aggregate_csv_filename"]
-            if "forensic_csv_filename" in general_config:
-                opts.forensic_csv_filename = general_config["forensic_csv_filename"]
-            if "smtp_tls_csv_filename" in general_config:
-                opts.smtp_tls_csv_filename = general_config["smtp_tls_csv_filename"]
-            if "dns_timeout" in general_config:
-                opts.dns_timeout = general_config.getfloat("dns_timeout")
-            if "dns_test_address" in general_config:
-                opts.dns_test_address = general_config["dns_test_address"]
-            if "nameservers" in general_config:
-                opts.nameservers = _str_to_list(general_config["nameservers"])
-                # nameservers pre-flight check
-                dummy_hostname = None
-                try:
-                    dummy_hostname = get_reverse_dns(
-                        opts.dns_test_address,
-                        nameservers=opts.nameservers,
-                        timeout=opts.dns_timeout,
-                    )
-                except Exception as ns_error:
-                    logger.critical("DNS pre-flight check failed: {}".format(ns_error))
-                    exit(-1)
-                if not dummy_hostname:
-                    logger.critical(
-                        "DNS pre-flight check failed: no PTR record for "
-                        "{} from {}".format(opts.dns_test_address, opts.nameservers)
-                    )
-                    exit(-1)
-            if "save_aggregate" in general_config:
-                opts.save_aggregate = general_config["save_aggregate"]
-            if "save_forensic" in general_config:
-                opts.save_forensic = general_config["save_forensic"]
-            if "save_smtp_tls" in general_config:
-                opts.save_smtp_tls = general_config["save_smtp_tls"]
-            if "debug" in general_config:
-                opts.debug = general_config.getboolean("debug")
-            if "verbose" in general_config:
-                opts.verbose = general_config.getboolean("verbose")
-            if "silent" in general_config:
-                opts.silent = general_config.getboolean("silent")
-            if "warnings" in general_config:
-                opts.warnings = general_config.getboolean("warnings")
-            if "log_file" in general_config:
-                opts.log_file = general_config["log_file"]
-            if "n_procs" in general_config:
-                opts.n_procs = general_config.getint("n_procs")
-            if "ip_db_path" in general_config:
-                opts.ip_db_path = general_config["ip_db_path"]
-            else:
-                opts.ip_db_path = None
-            if "always_use_local_files" in general_config:
-                opts.always_use_local_files = general_config.getboolean(
-                    "always_use_local_files"
-                )
-            if "reverse_dns_map_path" in general_config:
-                opts.reverse_dns_map_path = general_config["reverse_dns_path"]
-            if "reverse_dns_map_url" in general_config:
-                opts.reverse_dns_map_url = general_config["reverse_dns_url"]
-
-        if "mailbox" in config.sections():
-            mailbox_config = config["mailbox"]
-            if "msgraph" in config.sections():
-                opts.mailbox_reports_folder = "Inbox"
-            if "reports_folder" in mailbox_config:
-                opts.mailbox_reports_folder = mailbox_config["reports_folder"]
-            if "archive_folder" in mailbox_config:
-                opts.mailbox_archive_folder = mailbox_config["archive_folder"]
-            if "watch" in mailbox_config:
-                opts.mailbox_watch = mailbox_config.getboolean("watch")
-            if "delete" in mailbox_config:
-                opts.mailbox_delete = mailbox_config.getboolean("delete")
-            if "test" in mailbox_config:
-                opts.mailbox_test = mailbox_config.getboolean("test")
-            if "batch_size" in mailbox_config:
-                opts.mailbox_batch_size = mailbox_config.getint("batch_size")
-            if "check_timeout" in mailbox_config:
-                opts.mailbox_check_timeout = mailbox_config.getint("check_timeout")
-            if "since" in mailbox_config:
-                opts.mailbox_since = mailbox_config["since"]
-
-        if "imap" in config.sections():
-            imap_config = config["imap"]
-            if "watch" in imap_config:
-                logger.warning(
-                    "Starting in 8.0.0, the watch option has been "
-                    "moved from the imap configuration section to "
-                    "the mailbox configuration section."
-                )
-            if "host" in imap_config:
-                opts.imap_host = imap_config["host"]
-            else:
-                logger.error("host setting missing from the imap config section")
-                exit(-1)
-            if "port" in imap_config:
-                opts.imap_port = imap_config.getint("port")
-            if "timeout" in imap_config:
-                opts.imap_timeout = imap_config.getfloat("timeout")
-            if "max_retries" in imap_config:
-                opts.imap_max_retries = imap_config.getint("max_retries")
-            if "ssl" in imap_config:
-                opts.imap_ssl = imap_config.getboolean("ssl")
-            if "skip_certificate_verification" in imap_config:
-                imap_verify = imap_config.getboolean("skip_certificate_verification")
-                opts.imap_skip_certificate_verification = imap_verify
-            if "user" in imap_config:
-                opts.imap_user = imap_config["user"]
-            else:
-                logger.critical("user setting missing from the imap config section")
-                exit(-1)
-            if "password" in imap_config:
-                opts.imap_password = imap_config["password"]
-            else:
-                logger.critical("password setting missing from the imap config section")
-                exit(-1)
-            if "reports_folder" in imap_config:
-                opts.mailbox_reports_folder = imap_config["reports_folder"]
-                logger.warning(
-                    "Use of the reports_folder option in the imap "
-                    "configuration section has been deprecated. "
-                    "Use this option in the mailbox configuration "
-                    "section instead."
-                )
-            if "archive_folder" in imap_config:
-                opts.mailbox_archive_folder = imap_config["archive_folder"]
-                logger.warning(
-                    "Use of the archive_folder option in the imap "
-                    "configuration section has been deprecated. "
-                    "Use this option in the mailbox configuration "
-                    "section instead."
-                )
-            if "watch" in imap_config:
-                opts.mailbox_watch = imap_config.getboolean("watch")
-                logger.warning(
-                    "Use of the watch option in the imap "
-                    "configuration section has been deprecated. "
-                    "Use this option in the mailbox configuration "
-                    "section instead."
-                )
-            if "delete" in imap_config:
-                logger.warning(
-                    "Use of the delete option in the imap "
-                    "configuration section has been deprecated. "
-                    "Use this option in the mailbox configuration "
-                    "section instead."
-                )
-            if "test" in imap_config:
-                opts.mailbox_test = imap_config.getboolean("test")
-                logger.warning(
-                    "Use of the test option in the imap "
-                    "configuration section has been deprecated. "
-                    "Use this option in the mailbox configuration "
-                    "section instead."
-                )
-            if "batch_size" in imap_config:
-                opts.mailbox_batch_size = imap_config.getint("batch_size")
-                logger.warning(
-                    "Use of the batch_size option in the imap "
-                    "configuration section has been deprecated. "
-                    "Use this option in the mailbox configuration "
-                    "section instead."
-                )
-
-        if "msgraph" in config.sections():
-            graph_config = config["msgraph"]
-            opts.graph_token_file = graph_config.get("token_file", ".token")
-
-            if "auth_method" not in graph_config:
-                logger.info(
-                    "auth_method setting missing from the "
-                    "msgraph config section "
-                    "defaulting to UsernamePassword"
-                )
-                opts.graph_auth_method = AuthMethod.UsernamePassword.name
-            else:
-                opts.graph_auth_method = graph_config["auth_method"]
-
-            if opts.graph_auth_method == AuthMethod.UsernamePassword.name:
-                if "user" in graph_config:
-                    opts.graph_user = graph_config["user"]
-                else:
-                    logger.critical(
-                        "user setting missing from the msgraph config section"
-                    )
-                    exit(-1)
-                if "password" in graph_config:
-                    opts.graph_password = graph_config["password"]
-                else:
-                    logger.critical(
-                        "password setting missing from the msgraph config section"
-                    )
-                if "client_secret" in graph_config:
-                    opts.graph_client_secret = graph_config["client_secret"]
-                else:
-                    logger.critical(
-                        "client_secret setting missing from the msgraph config section"
-                    )
-                    exit(-1)
-
-            if opts.graph_auth_method == AuthMethod.DeviceCode.name:
-                if "user" in graph_config:
-                    opts.graph_user = graph_config["user"]
-
-            if opts.graph_auth_method != AuthMethod.UsernamePassword.name:
-                if "tenant_id" in graph_config:
-                    opts.graph_tenant_id = graph_config["tenant_id"]
-                else:
-                    logger.critical(
-                        "tenant_id setting missing from the msgraph config section"
-                    )
-                    exit(-1)
-
-            if opts.graph_auth_method == AuthMethod.ClientSecret.name:
-                if "client_secret" in graph_config:
-                    opts.graph_client_secret = graph_config["client_secret"]
-                else:
-                    logger.critical(
-                        "client_secret setting missing from the msgraph config section"
-                    )
-                    exit(-1)
-
-            if "client_id" in graph_config:
-                opts.graph_client_id = graph_config["client_id"]
-            else:
-                logger.critical(
-                    "client_id setting missing from the msgraph config section"
-                )
-                exit(-1)
-
-            if "mailbox" in graph_config:
-                opts.graph_mailbox = graph_config["mailbox"]
-            elif opts.graph_auth_method != AuthMethod.UsernamePassword.name:
-                logger.critical(
-                    "mailbox setting missing from the msgraph config section"
-                )
-                exit(-1)
-
-            if "graph_url" in graph_config:
-                opts.graph_url = graph_config["graph_url"]
-
-            if "allow_unencrypted_storage" in graph_config:
-                opts.graph_allow_unencrypted_storage = graph_config.getboolean(
-                    "allow_unencrypted_storage"
-                )
-
-        if "elasticsearch" in config:
-            elasticsearch_config = config["elasticsearch"]
-            if "hosts" in elasticsearch_config:
-                opts.elasticsearch_hosts = _str_to_list(elasticsearch_config["hosts"])
-            else:
-                logger.critical(
-                    "hosts setting missing from the elasticsearch config section"
-                )
-                exit(-1)
-            if "timeout" in elasticsearch_config:
-                timeout = elasticsearch_config.getfloat("timeout")
-                opts.elasticsearch_timeout = timeout
-            if "number_of_shards" in elasticsearch_config:
-                number_of_shards = elasticsearch_config.getint("number_of_shards")
-                opts.elasticsearch_number_of_shards = number_of_shards
-                if "number_of_replicas" in elasticsearch_config:
-                    number_of_replicas = elasticsearch_config.getint(
-                        "number_of_replicas"
-                    )
-                    opts.elasticsearch_number_of_replicas = number_of_replicas
-            if "index_suffix" in elasticsearch_config:
-                opts.elasticsearch_index_suffix = elasticsearch_config["index_suffix"]
-            if "index_prefix" in elasticsearch_config:
-                opts.elasticsearch_index_prefix = elasticsearch_config["index_prefix"]
-            if "monthly_indexes" in elasticsearch_config:
-                monthly = elasticsearch_config.getboolean("monthly_indexes")
-                opts.elasticsearch_monthly_indexes = monthly
-            if "ssl" in elasticsearch_config:
-                opts.elasticsearch_ssl = elasticsearch_config.getboolean("ssl")
-            if "cert_path" in elasticsearch_config:
-                opts.elasticsearch_ssl_cert_path = elasticsearch_config["cert_path"]
-            if "user" in elasticsearch_config:
-                opts.elasticsearch_username = elasticsearch_config["user"]
-            if "password" in elasticsearch_config:
-                opts.elasticsearch_password = elasticsearch_config["password"]
-            if "apiKey" in elasticsearch_config:
-                opts.elasticsearch_apiKey = elasticsearch_config["apiKey"]
-
-        if "opensearch" in config:
-            opensearch_config = config["opensearch"]
-            if "hosts" in opensearch_config:
-                opts.opensearch_hosts = _str_to_list(opensearch_config["hosts"])
-            else:
-                logger.critical(
-                    "hosts setting missing from the opensearch config section"
-                )
-                exit(-1)
-            if "timeout" in opensearch_config:
-                timeout = opensearch_config.getfloat("timeout")
-                opts.opensearch_timeout = timeout
-            if "number_of_shards" in opensearch_config:
-                number_of_shards = opensearch_config.getint("number_of_shards")
-                opts.opensearch_number_of_shards = number_of_shards
-                if "number_of_replicas" in opensearch_config:
-                    number_of_replicas = opensearch_config.getint("number_of_replicas")
-                    opts.opensearch_number_of_replicas = number_of_replicas
-            if "index_suffix" in opensearch_config:
-                opts.opensearch_index_suffix = opensearch_config["index_suffix"]
-            if "index_prefix" in opensearch_config:
-                opts.opensearch_index_prefix = opensearch_config["index_prefix"]
-            if "monthly_indexes" in opensearch_config:
-                monthly = opensearch_config.getboolean("monthly_indexes")
-                opts.opensearch_monthly_indexes = monthly
-            if "ssl" in opensearch_config:
-                opts.opensearch_ssl = opensearch_config.getboolean("ssl")
-            if "cert_path" in opensearch_config:
-                opts.opensearch_ssl_cert_path = opensearch_config["cert_path"]
-            if "user" in opensearch_config:
-                opts.opensearch_username = opensearch_config["user"]
-            if "password" in opensearch_config:
-                opts.opensearch_password = opensearch_config["password"]
-            if "apiKey" in opensearch_config:
-                opts.opensearch_apiKey = opensearch_config["apiKey"]
-
-        if "splunk_hec" in config.sections():
-            hec_config = config["splunk_hec"]
-            if "url" in hec_config:
-                opts.hec = hec_config["url"]
-            else:
-                logger.critical(
-                    "url setting missing from the splunk_hec config section"
-                )
-                exit(-1)
-            if "token" in hec_config:
-                opts.hec_token = hec_config["token"]
-            else:
-                logger.critical(
-                    "token setting missing from the splunk_hec config section"
-                )
-                exit(-1)
-            if "index" in hec_config:
-                opts.hec_index = hec_config["index"]
-            else:
-                logger.critical(
-                    "index setting missing from the splunk_hec config section"
-                )
-                exit(-1)
-            if "skip_certificate_verification" in hec_config:
-                opts.hec_skip_certificate_verification = hec_config[
-                    "skip_certificate_verification"
-                ]
-
-        if "kafka" in config.sections():
-            kafka_config = config["kafka"]
-            if "hosts" in kafka_config:
-                opts.kafka_hosts = _str_to_list(kafka_config["hosts"])
-            else:
-                logger.critical("hosts setting missing from the kafka config section")
-                exit(-1)
-            if "user" in kafka_config:
-                opts.kafka_username = kafka_config["user"]
-            if "password" in kafka_config:
-                opts.kafka_password = kafka_config["password"]
-            if "ssl" in kafka_config:
-                opts.kafka_ssl = kafka_config.getboolean("ssl")
-            if "skip_certificate_verification" in kafka_config:
-                kafka_verify = kafka_config.getboolean("skip_certificate_verification")
-                opts.kafka_skip_certificate_verification = kafka_verify
-            if "aggregate_topic" in kafka_config:
-                opts.kafka_aggregate_topic = kafka_config["aggregate_topic"]
-            else:
-                logger.critical(
-                    "aggregate_topic setting missing from the kafka config section"
-                )
-                exit(-1)
-            if "forensic_topic" in kafka_config:
-                opts.kafka_forensic_topic = kafka_config["forensic_topic"]
-            else:
-                logger.critical(
-                    "forensic_topic setting missing from the kafka config section"
-                )
-            if "smtp_tls_topic" in kafka_config:
-                opts.kafka_smtp_tls_topic = kafka_config["smtp_tls_topic"]
-            else:
-                logger.critical(
-                    "forensic_topic setting missing from the splunk_hec config section"
-                )
-
-        if "smtp" in config.sections():
-            smtp_config = config["smtp"]
-            if "host" in smtp_config:
-                opts.smtp_host = smtp_config["host"]
-            else:
-                logger.critical("host setting missing from the smtp config section")
-                exit(-1)
-            if "port" in smtp_config:
-                opts.smtp_port = smtp_config.getint("port")
-            if "ssl" in smtp_config:
-                opts.smtp_ssl = smtp_config.getboolean("ssl")
-            if "skip_certificate_verification" in smtp_config:
-                smtp_verify = smtp_config.getboolean("skip_certificate_verification")
-                opts.smtp_skip_certificate_verification = smtp_verify
-            if "user" in smtp_config:
-                opts.smtp_user = smtp_config["user"]
-            else:
-                logger.critical("user setting missing from the smtp config section")
-                exit(-1)
-            if "password" in smtp_config:
-                opts.smtp_password = smtp_config["password"]
-            else:
-                logger.critical("password setting missing from the smtp config section")
-                exit(-1)
-            if "from" in smtp_config:
-                opts.smtp_from = smtp_config["from"]
-            else:
-                logger.critical("from setting missing from the smtp config section")
-            if "to" in smtp_config:
-                opts.smtp_to = _str_to_list(smtp_config["to"])
-            else:
-                logger.critical("to setting missing from the smtp config section")
-            if "subject" in smtp_config:
-                opts.smtp_subject = smtp_config["subject"]
-            if "attachment" in smtp_config:
-                opts.smtp_attachment = smtp_config["attachment"]
-            if "message" in smtp_config:
-                opts.smtp_message = smtp_config["message"]
-
-        if "s3" in config.sections():
-            s3_config = config["s3"]
-            if "bucket" in s3_config:
-                opts.s3_bucket = s3_config["bucket"]
-            else:
-                logger.critical("bucket setting missing from the s3 config section")
-                exit(-1)
-            if "path" in s3_config:
-                opts.s3_path = s3_config["path"]
-                if opts.s3_path.startswith("/"):
-                    opts.s3_path = opts.s3_path[1:]
-                if opts.s3_path.endswith("/"):
-                    opts.s3_path = opts.s3_path[:-1]
-            else:
-                opts.s3_path = ""
-
-            if "region_name" in s3_config:
-                opts.s3_region_name = s3_config["region_name"]
-            if "endpoint_url" in s3_config:
-                opts.s3_endpoint_url = s3_config["endpoint_url"]
-            if "access_key_id" in s3_config:
-                opts.s3_access_key_id = s3_config["access_key_id"]
-            if "secret_access_key" in s3_config:
-                opts.s3_secret_access_key = s3_config["secret_access_key"]
-
-        if "syslog" in config.sections():
-            syslog_config = config["syslog"]
-            if "server" in syslog_config:
-                opts.syslog_server = syslog_config["server"]
-            else:
-                logger.critical("server setting missing from the syslog config section")
-                exit(-1)
-            if "port" in syslog_config:
-                opts.syslog_port = syslog_config["port"]
-            else:
-                opts.syslog_port = 514
-
-        if "gmail_api" in config.sections():
-            gmail_api_config = config["gmail_api"]
-            opts.gmail_api_credentials_file = gmail_api_config.get("credentials_file")
-            opts.gmail_api_token_file = gmail_api_config.get("token_file", ".token")
-            opts.gmail_api_service_account_file = gmail_api_config.get("service_account_file")
-            opts.gmail_api_delegated_account = gmail_api_config.get("delegated_account")
-            opts.gmail_api_include_spam_trash = gmail_api_config.getboolean(
-                "include_spam_trash", False
-            )
-            opts.gmail_api_paginate_messages = gmail_api_config.getboolean(
-                "paginate_messages", True
-            )
-            opts.gmail_api_scopes = gmail_api_config.get(
-                "scopes", default_gmail_api_scope
-            )
-            opts.gmail_api_scopes = _str_to_list(opts.gmail_api_scopes)
-            if "oauth2_port" in gmail_api_config:
-                opts.gmail_api_oauth2_port = gmail_api_config.get("oauth2_port", 8080)
-
-        if "maildir" in config.sections():
-            maildir_api_config = config["maildir"]
-            opts.maildir_path = maildir_api_config.get("maildir_path")
-            opts.maildir_create = maildir_api_config.get("maildir_create")
-
-        if "log_analytics" in config.sections():
-            log_analytics_config = config["log_analytics"]
-            opts.la_client_id = log_analytics_config.get("client_id")
-            opts.la_client_secret = log_analytics_config.get("client_secret")
-            opts.la_tenant_id = log_analytics_config.get("tenant_id")
-            opts.la_dce = log_analytics_config.get("dce")
-            opts.la_dcr_immutable_id = log_analytics_config.get("dcr_immutable_id")
-            opts.la_dcr_aggregate_stream = log_analytics_config.get(
-                "dcr_aggregate_stream"
-            )
-            opts.la_dcr_forensic_stream = log_analytics_config.get(
-                "dcr_forensic_stream"
-            )
-            opts.la_dcr_smtp_tls_stream = log_analytics_config.get(
-                "dcr_smtp_tls_stream"
-            )
-
-        if "gelf" in config.sections():
-            gelf_config = config["gelf"]
-            if "host" in gelf_config:
-                opts.gelf_host = gelf_config["host"]
-            else:
-                logger.critical("host setting missing from the gelf config section")
-                exit(-1)
-            if "port" in gelf_config:
-                opts.gelf_port = gelf_config["port"]
-            else:
-                logger.critical("port setting missing from the gelf config section")
-                exit(-1)
-            if "mode" in gelf_config:
-                opts.gelf_mode = gelf_config["mode"]
-            else:
-                logger.critical("mode setting missing from the gelf config section")
-                exit(-1)
-
-        if "webhook" in config.sections():
-            webhook_config = config["webhook"]
-            if "aggregate_url" in webhook_config:
-                opts.webhook_aggregate_url = webhook_config["aggregate_url"]
-            if "forensic_url" in webhook_config:
-                opts.webhook_forensic_url = webhook_config["forensic_url"]
-            if "smtp_tls_url" in webhook_config:
-                opts.webhook_smtp_tls_url = webhook_config["smtp_tls_url"]
-            if "timeout" in webhook_config:
-                opts.webhook_timeout = webhook_config["timeout"]
 
     logger.setLevel(logging.ERROR)
 
@@ -1205,182 +2635,118 @@ def _main():
             )
             fh.setFormatter(formatter)
             logger.addHandler(fh)
-            logger.info("Logging to file: %s", opts.log_file)
         except Exception as error:
-            logger.warning("Unable to write to log file: {}".format(error))
+            logger.warning(f"Unable to write to log file: {error}")
+
+    opts.active_log_file = opts.log_file
+    _configure_dependency_logging(logger.level)
 
     if (
         opts.imap_host is None
         and opts.graph_client_id is None
-        and (opts.gmail_api_credentials_file is None and opts.gmail_api_service_account_file is None)
+        and opts.gmail_api_credentials_file is None
         and opts.maildir_path is None
         and len(opts.file_path) == 0
     ):
         logger.error("You must supply input files or a mailbox connection")
         exit(1)
 
-    logger.info("Starting parsedmarc v%s", __version__)
-    logger.debug("OPTIONS: %s", opts)
+    logger.info("Starting parsedmarc")
 
+    load_ip_db(
+        always_use_local_file=opts.always_use_local_files,
+        local_file_path=opts.ip_db_path,
+        url=opts.ipinfo_url,
+        offline=opts.offline,
+    )
 
-    if opts.save_aggregate or opts.save_forensic or opts.save_smtp_tls:
+    if opts.ipinfo_api_token and not opts.offline:
         try:
-            if opts.elasticsearch_hosts:
-                logger.info("Setting up Elasticsearch client...")
-                es_aggregate_index = "dmarc_aggregate"
-                es_forensic_index = "dmarc_forensic"
-                es_smtp_tls_index = "smtp_tls"
-                if opts.elasticsearch_index_suffix:
-                    suffix = opts.elasticsearch_index_suffix
-                    es_aggregate_index = "{0}_{1}".format(es_aggregate_index, suffix)
-                    es_forensic_index = "{0}_{1}".format(es_forensic_index, suffix)
-                    es_smtp_tls_index = "{0}_{1}".format(es_smtp_tls_index, suffix)
-                if opts.elasticsearch_index_prefix:
-                    prefix = opts.elasticsearch_index_prefix
-                    es_aggregate_index = "{0}{1}".format(prefix, es_aggregate_index)
-                    es_forensic_index = "{0}{1}".format(prefix, es_forensic_index)
-                    es_smtp_tls_index = "{0}{1}".format(prefix, es_smtp_tls_index)
-                elastic.set_hosts(
-                    opts.elasticsearch_hosts,
-                    opts.elasticsearch_ssl,
-                    opts.elasticsearch_ssl_cert_path,
-                    opts.elasticsearch_username,
-                    opts.elasticsearch_password,
-                    opts.elasticsearch_apiKey,
-                    timeout=opts.elasticsearch_timeout,
-                )
-                elastic.migrate_indexes(
-                    aggregate_indexes=[es_aggregate_index],
-                    forensic_indexes=[es_forensic_index],
-                )
-        except elastic.ElasticsearchError:
-            logger.exception("Elasticsearch Error")
+            configure_ipinfo_api(opts.ipinfo_api_token)
+        except InvalidIPinfoAPIKey as e:
+            logger.critical(str(e))
             exit(1)
 
+    load_psl_overrides(
+        always_use_local_file=opts.always_use_local_files,
+        local_file_path=opts.psl_overrides_path,
+        url=opts.psl_overrides_url,
+        offline=opts.offline,
+    )
+
+    # Initialize output clients (with retry for transient connection errors)
+    clients = {}
+    max_retries = 4
+    retry_delay = 5
+    for attempt in range(max_retries + 1):
         try:
-            if opts.opensearch_hosts:
-                logger.info("Setting up OpenSearch client...")
-                os_aggregate_index = "dmarc_aggregate"
-                os_forensic_index = "dmarc_forensic"
-                os_smtp_tls_index = "smtp_tls"
-                if opts.opensearch_index_suffix:
-                    suffix = opts.opensearch_index_suffix
-                    os_aggregate_index = "{0}_{1}".format(os_aggregate_index, suffix)
-                    os_forensic_index = "{0}_{1}".format(os_forensic_index, suffix)
-                    os_smtp_tls_index = "{0}_{1}".format(os_smtp_tls_index, suffix)
-                if opts.opensearch_index_prefix:
-                    prefix = opts.opensearch_index_prefix
-                    os_aggregate_index = "{0}{1}".format(prefix, os_aggregate_index)
-                    os_forensic_index = "{0}{1}".format(prefix, os_forensic_index)
-                    os_smtp_tls_index = "{0}{1}".format(prefix, os_smtp_tls_index)
-                opensearch.set_hosts(
-                    opts.opensearch_hosts,
-                    opts.opensearch_ssl,
-                    opts.opensearch_ssl_cert_path,
-                    opts.opensearch_username,
-                    opts.opensearch_password,
-                    opts.opensearch_apiKey,
-                    timeout=opts.opensearch_timeout,
-                )
-                opensearch.migrate_indexes(
-                    aggregate_indexes=[os_aggregate_index],
-                    forensic_indexes=[os_forensic_index],
-                )
-        except opensearch.OpenSearchError:
-            logger.exception("OpenSearch Error")
+            clients = _init_output_clients(
+                opts, index_prefix_domain_map=index_prefix_domain_map
+            )
+            break
+        except ConfigurationError as e:
+            logger.critical(str(e))
             exit(1)
-
-    if opts.s3_bucket:
-        try:
-            logger.info("Setting up S3 client for bucket %s", opts.s3_bucket)
-            s3_client = s3.S3Client(
-                bucket_name=opts.s3_bucket,
-                bucket_path=opts.s3_path,
-                region_name=opts.s3_region_name,
-                endpoint_url=opts.s3_endpoint_url,
-                access_key_id=opts.s3_access_key_id,
-                secret_access_key=opts.s3_secret_access_key,
-            )
         except Exception as error_:
-            logger.error("S3 Error: {0}".format(error_.__str__()))
+            if attempt < max_retries:
+                logger.warning(
+                    "Output client error (attempt %d/%d, retrying in %ds): %s",
+                    attempt + 1,
+                    max_retries + 1,
+                    retry_delay,
+                    error_,
+                )
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                logger.error(f"Output client error: {error_}")
+                exit(1)
 
-    if opts.syslog_server:
-        try:
-            logger.info("Setting up Syslog client for %s", opts.syslog_server)
-            syslog_client = syslog.SyslogClient(
-                server_name=opts.syslog_server,
-                server_port=int(opts.syslog_port),
-            )
-        except Exception as error_:
-            logger.error("Syslog Error: {0}".format(error_.__str__()))
+    # Always close output clients on the way out (normal return,
+    # exit(N), uncaught exception, or SystemExit from a signal-driven
+    # shutdown). atexit does NOT fire on os._exit(130) — that's
+    # intentional for the SIGINT double-tap. The lambda closes whatever
+    # `clients` currently points at, so a SIGHUP reload that swaps the
+    # dict in-place is still covered.
+    atexit.register(lambda: _close_output_clients(clients))
 
-    if opts.hec:
-        if opts.hec_token is None or opts.hec_index is None:
-            logger.error("HEC token and HEC index are required when using HEC URL")
-            exit(1)
-        logger.info("Setting up Splunk HEC client for %s", opts.hec)
-        verify = True
-        if opts.hec_skip_certificate_verification:
-            verify = False
-        hec_client = splunk.HECClient(
-            opts.hec, opts.hec_token, opts.hec_index, verify=verify
-        )
+    # Signal handlers set a cooperative flag polled at safe checkpoints:
+    # the one-shot loops check it between batches; the watch loop relies
+    # on the mailbox backend polling `config_reloading` (which includes
+    # this flag) between checks, including inside the IMAP IDLE loop, so
+    # the current batch finishes before the watcher exits. SIGINT is a
+    # "double tap": the first press is graceful, the second short-circuits
+    # to os._exit(130). os._exit is async-signal-safe; sys.exit and
+    # logging are not, so the handlers only set flags / call os._exit.
+    _reload_requested = False
+    _shutdown_requested = False
+    _sigint_count = 0
 
-    if opts.kafka_hosts:
-        try:
-            logger.info("Setting up Kafka client for %s", opts.kafka_hosts)
-            ssl_context = None
-            if opts.kafka_skip_certificate_verification:
-                logger.debug("Skipping Kafka certificate verification")
-                ssl_context = create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = CERT_NONE
-            kafka_client = kafkaclient.KafkaClient(
-                opts.kafka_hosts,
-                username=opts.kafka_username,
-                password=opts.kafka_password,
-                ssl_context=ssl_context,
-            )
-        except Exception as error_:
-            logger.error("Kafka Error: {0}".format(error_.__str__()))
+    def _handle_sighup(signum, frame):
+        nonlocal _reload_requested
+        _reload_requested = True
 
-    if opts.gelf_host:
-        try:
-            logger.info("Setting up GELF client for %s", opts.gelf_host)
-            gelf_client = gelf.GelfClient(
-                host=opts.gelf_host,
-                port=int(opts.gelf_port),
-                mode=opts.gelf_mode,
-            )
-        except Exception as error_:
-            logger.error("GELF Error: {0}".format(error_.__str__()))
+    def _handle_sigterm(signum, frame):
+        nonlocal _shutdown_requested
+        _shutdown_requested = True
 
-    if (
-        opts.webhook_aggregate_url
-        or opts.webhook_forensic_url
-        or opts.webhook_smtp_tls_url
-    ):
-        try:
-            logger.info("Setting up Webhook client...")
-            webhook_client = webhook.WebhookClient(
-                aggregate_url=opts.webhook_aggregate_url,
-                forensic_url=opts.webhook_forensic_url,
-                smtp_tls_url=opts.webhook_smtp_tls_url,
-                timeout=opts.webhook_timeout,
-            )
-        except Exception as error_:
-            logger.error("Webhook Error: {0}".format(error_.__str__()))
+    def _handle_sigint(signum, frame):
+        nonlocal _shutdown_requested, _sigint_count
+        _sigint_count += 1
+        if _sigint_count >= 2:
+            os._exit(130)
+        _shutdown_requested = True
 
-    kafka_aggregate_topic = opts.kafka_aggregate_topic
-    kafka_forensic_topic = opts.kafka_forensic_topic
-    kafka_smtp_tls_topic = opts.kafka_smtp_tls_topic
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _handle_sighup)
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigint)
 
-    file_paths = []
+    file_paths = _expand_file_path_args(args.file_path, recursive=args.recursive)
+    if opts.archive_directory:
+        file_paths = _exclude_archived_paths(file_paths, opts.archive_directory)
     mbox_paths = []
 
-    logger.info("Searching for files in specified paths...")
-    for file_path in args.file_path:
-        file_paths += glob(file_path)
     for file_path in file_paths:
         if is_mbox(file_path):
             mbox_paths.append(file_path)
@@ -1391,134 +2757,116 @@ def _main():
     for mbox_path in mbox_paths:
         file_paths.remove(mbox_path)
 
-    logger.info("Found %d total files, including %d mbox files.", len(file_paths) + len(mbox_paths), len(mbox_paths))
+    pbar = None
+    if sys.stderr.isatty() and len(file_paths) > 0:
+        pbar = tqdm(total=len(file_paths))
 
-    counter = 0
-    results = []
+    n_procs = int(opts.n_procs or 1)
+    if n_procs < 1:
+        n_procs = 1
 
-    if len(file_paths) > 0:
-        logger.info("Processing %d individual report files...", len(file_paths))
-        if sys.stdout.isatty():
-            pbar = tqdm(total=len(file_paths), desc="Processing files")
+    parser_config = _build_parser_config(opts)
 
-        for batch_index in range(math.ceil(len(file_paths) / opts.n_procs)):
-            processes = []
-            connections = []
-
-            for proc_index in range(
-                opts.n_procs * batch_index, opts.n_procs * (batch_index + 1)
-            ):
-                if proc_index >= len(file_paths):
-                    break
-
-                parent_conn, child_conn = Pipe()
-                connections.append(parent_conn)
-
-                process = Process(
-                    target=cli_parse,
-                    args=(
-                        file_paths[proc_index],
-                        opts.strip_attachment_payloads,
-                        opts.nameservers,
-                        opts.dns_timeout,
-                        opts.ip_db_path,
-                        opts.offline,
-                        opts.always_use_local_files,
-                        opts.reverse_dns_map_path,
-                        opts.reverse_dns_map_url,
-                        child_conn,
-                    ),
-                )
-                processes.append(process)
-
-            for proc in processes:
-                proc.start()
-
-            for conn in connections:
-                results.append(conn.recv())
-
-            for proc in processes:
-                proc.join()
-                if sys.stdout.isatty():
-                    counter += 1
-                    pbar.update(counter - pbar.n)
-        
-        if sys.stdout.isatty():
-            pbar.close()
-
-    for result in results:
-        if type(result[0]) is ParserError:
-            logger.error("Failed to parse {0} - {1}".format(result[1], result[0]))
+    func = functools.partial(_parse_report_file_job, config=parser_config)
+    for file_path, result in parallel_map(
+        func, file_paths, n_procs, should_stop=lambda: _shutdown_requested
+    ):
+        if pbar is not None:
+            pbar.update(1)
+        if isinstance(result, Exception):
+            logger.error(f"Failed to parse {file_path} - {result}")
         else:
-            if result[0]["report_type"] == "aggregate":
-                report_org = result[0]["report"]["report_metadata"]["org_name"]
-                report_id = result[0]["report"]["report_metadata"]["report_id"]
+            if result["report_type"] == "aggregate":
+                report_org = result["report"]["report_metadata"]["org_name"]
+                report_id = result["report"]["report_metadata"]["report_id"]
                 report_key = f"{report_org}_{report_id}"
                 if report_key not in SEEN_AGGREGATE_REPORT_IDS:
                     SEEN_AGGREGATE_REPORT_IDS[report_key] = True
-                    aggregate_reports.append(result[0]["report"])
+                    aggregate_reports.append(result["report"])
                 else:
                     logger.debug(
                         "Skipping duplicate aggregate report "
                         f"from {report_org} with ID: {report_id}"
                     )
-            elif result[0]["report_type"] == "forensic":
-                forensic_reports.append(result[0]["report"])
-            elif result[0]["report_type"] == "smtp_tls":
-                smtp_tls_reports.append(result[0]["report"])
-    
-    logger.info(
-        "Parsed %d aggregate, %d forensic, and %d SMTP TLS reports from individual files.",
-        len(aggregate_reports),
-        len(forensic_reports),
-        len(smtp_tls_reports),
-    )
+            elif result["report_type"] == "failure":
+                failure_reports.append(result["report"])
+            elif result["report_type"] == "smtp_tls":
+                smtp_tls_reports.append(result["report"])
+        if opts.archive_directory:
+            _archive_processed_file(file_path, opts.archive_directory, result)
 
-    if len(mbox_paths) > 0:
-        logger.info("Processing %d mbox files...", len(mbox_paths))
-        for mbox_path in mbox_paths:
-            logger.debug("Processing mbox: %s", mbox_path)
-            strip = opts.strip_attachment_payloads
-            reports = get_dmarc_reports_from_mbox(
-                mbox_path,
-                nameservers=opts.nameservers,
-                dns_timeout=opts.dns_timeout,
-                strip_attachment_payloads=strip,
-                ip_db_path=opts.ip_db_path,
-                always_use_local_files=opts.always_use_local_files,
-                reverse_dns_map_path=opts.reverse_dns_map_path,
-                reverse_dns_map_url=opts.reverse_dns_map_url,
-                offline=opts.offline,
-            )
-            aggregate_reports += reports["aggregate_reports"]
-            forensic_reports += reports["forensic_reports"]
-            smtp_tls_reports += reports["smtp_tls_reports"]
-        logger.info("Finished processing mbox files.")
+    if pbar is not None:
+        pbar.close()
+
+    if _shutdown_requested:
+        # Anything already parsed is still in aggregate_reports /
+        # failure_reports / smtp_tls_reports and will go through
+        # process_reports() in the cleanup path so we don't lose work
+        # the operator already paid for.
+        logger.info("Shutdown requested, stopping file processing early")
+
+    for mbox_path in mbox_paths:
+        if _shutdown_requested:
+            logger.info("Shutdown requested, skipping remaining mbox files")
+            break
+        reports = get_dmarc_reports_from_mbox(
+            mbox_path,
+            config=parser_config,
+            n_procs=n_procs,
+        )
+        aggregate_reports += reports["aggregate_reports"]
+        failure_reports += reports["failure_reports"]
+        smtp_tls_reports += reports["smtp_tls_reports"]
+
+    # Snapshot of the file/mbox-derived reports, taken before the mailbox
+    # block below appends anything fetched from a live mailbox connection.
+    # Mailbox batches are handed to process_reports() by
+    # mailbox_save_callback() before get_dmarc_reports_from_mailbox() even
+    # returns -- that is what lets it decide whether archiving is safe -- so
+    # the final process_reports() call runs on this snapshot only, or the
+    # mailbox-derived reports would be saved twice.
+    file_parsing_results: ParsingResults = {
+        "aggregate_reports": list(aggregate_reports),
+        "failure_reports": list(failure_reports),
+        "smtp_tls_reports": list(smtp_tls_reports),
+    }
 
     mailbox_connection = None
+    msgraph_connection: MSGraphConnection | None = None
+    mailbox_batch_size_value = 10
+    mailbox_check_timeout_value = 30
+    mailbox_max_unsaved_retries_value = 2
+
     if opts.imap_host:
         try:
-            logger.info("Connecting to IMAP host: %s", opts.imap_host)
             if opts.imap_user is None or opts.imap_password is None:
                 logger.error(
-                    "IMAP user and password must be specified ifhost is specified"
+                    "IMAP user and password must be specified if host is specified"
                 )
+                exit(1)
 
             ssl = True
             verify = True
             if opts.imap_skip_certificate_verification:
                 logger.debug("Skipping IMAP certificate verification")
                 verify = False
-            if opts.imap_ssl is False:
+            if not opts.imap_ssl:
                 ssl = False
 
+            imap_timeout = (
+                int(opts.imap_timeout) if opts.imap_timeout is not None else 30
+            )
+            imap_max_retries = (
+                int(opts.imap_max_retries) if opts.imap_max_retries is not None else 4
+            )
+            imap_port_value = int(opts.imap_port) if opts.imap_port is not None else 993
             mailbox_connection = IMAPConnection(
                 host=opts.imap_host,
-                port=opts.imap_port,
+                port=imap_port_value,
                 ssl=ssl,
                 verify=verify,
-                timeout=opts.imap_timeout,
-                max_retries=opts.imap_max_retries,
+                timeout=imap_timeout,
+                max_retries=imap_max_retries,
                 user=opts.imap_user,
                 password=opts.imap_password,
             )
@@ -1529,28 +2877,89 @@ def _main():
 
     if opts.graph_client_id:
         try:
-            logger.info("Connecting to MS Graph API...")
             mailbox = opts.graph_mailbox or opts.graph_user
+            # Redacted connection summary: enough to spot a wrong
+            # tenant/client/mailbox at a glance, before any network I/O,
+            # so a hang during credential construction leaves a trace.
+            # Secret values are never logged.
+            logger.info(
+                "Connecting to Microsoft Graph (auth_method=%s, tenant_id=%s, "
+                "client_id=%s, mailbox=%s, graph_url=%s)",
+                opts.graph_auth_method,
+                opts.graph_tenant_id,
+                opts.graph_client_id,
+                mailbox,
+                opts.graph_url,
+            )
+            logger.debug(
+                "Microsoft Graph auth details: username=%s, "
+                "certificate_path=%s, certificate_password %s, "
+                "client_secret %s, password %s, client_assertion %s, "
+                "token_file=%s, allow_unencrypted_storage=%s",
+                opts.graph_user,
+                opts.graph_certificate_path,
+                "set" if opts.graph_certificate_password else "not set",
+                "set" if opts.graph_client_secret else "not set",
+                "set" if opts.graph_password else "not set",
+                "set" if opts.graph_client_assertion else "not set",
+                opts.graph_token_file,
+                bool(opts.graph_allow_unencrypted_storage),
+            )
+            connect_start = time.monotonic()
             mailbox_connection = MSGraphConnection(
                 auth_method=opts.graph_auth_method,
                 mailbox=mailbox,
                 tenant_id=opts.graph_tenant_id,
                 client_id=opts.graph_client_id,
                 client_secret=opts.graph_client_secret,
+                certificate_path=opts.graph_certificate_path,
+                certificate_password=opts.graph_certificate_password,
+                client_assertion=opts.graph_client_assertion,
                 username=opts.graph_user,
                 password=opts.graph_password,
                 token_file=opts.graph_token_file,
-                allow_unencrypted_storage=opts.graph_allow_unencrypted_storage,
+                allow_unencrypted_storage=bool(opts.graph_allow_unencrypted_storage),
                 graph_url=opts.graph_url,
+                token_cache_name="parsedmarc",
             )
+            # App-only methods (ClientSecret/Certificate) construct their
+            # credential lazily; the first token request happens on the
+            # first mailbox call, so failures can still surface later.
+            logger.info(
+                "Microsoft Graph connection initialized in %.2f seconds",
+                time.monotonic() - connect_start,
+            )
+            msgraph_connection = mailbox_connection
 
+        except (ClientAuthenticationError, APIError, httpx.HTTPError) as error:
+            _log_msgraph_failure(
+                error,
+                stage="connection",
+                mailbox=opts.graph_mailbox or opts.graph_user,
+                tenant_id=opts.graph_tenant_id,
+                auth_method=opts.graph_auth_method,
+            )
+            exit(1)
         except Exception:
-            logger.exception("MS Graph Error") 
+            logger.exception("MS Graph Error")
             exit(1)
 
-    if opts.gmail_api_credentials_file or opts.gmail_api_service_account_file:
-        logger.info("Connecting to Gmail API...")
-        if opts.mailbox_delete:
+    if opts.gmail_api_credentials_file:
+        # Any effective delete flag needs the deletion scope: the per-report-type
+        # flags inherit mailbox_delete when unset (None), so this reduces to
+        # mailbox_delete alone when none of them is set. The scope is a
+        # mailbox-wide capability grant rather than a per-type one, so when it
+        # is missing every flag is turned off explicitly.
+        per_type_delete_opts = (
+            "mailbox_delete_aggregate",
+            "mailbox_delete_failure",
+            "mailbox_delete_smtp_tls",
+            "mailbox_delete_invalid",
+        )
+        if any(
+            opts.mailbox_delete if getattr(opts, name) is None else getattr(opts, name)
+            for name in per_type_delete_opts
+        ):
             if "https://mail.google.com/" not in opts.gmail_api_scopes:
                 logger.error(
                     "Message deletion requires scope"
@@ -1559,6 +2968,8 @@ def _main():
                     "to acquire proper access."
                 )
                 opts.mailbox_delete = False
+                for name in per_type_delete_opts:
+                    setattr(opts, name, False)
 
         try:
             mailbox_connection = GmailConnection(
@@ -1568,9 +2979,9 @@ def _main():
                 include_spam_trash=opts.gmail_api_include_spam_trash,
                 paginate_messages=opts.gmail_api_paginate_messages,
                 reports_folder=opts.mailbox_reports_folder,
-                oauth2_port=opts.gmail_api_oauth2_port, 
-                service_account_file=opts.gmail_api_service_account_file,
-                delegated_account=opts.gmail_api_delegated_account,
+                oauth2_port=opts.gmail_api_oauth2_port,
+                auth_mode=opts.gmail_api_auth_mode,
+                service_account_user=opts.gmail_api_service_account_user,
             )
 
         except Exception:
@@ -1579,7 +2990,6 @@ def _main():
 
     if opts.maildir_path:
         try:
-            logger.info("Connecting to Maildir at %s", opts.maildir_path)
             mailbox_connection = MaildirConnection(
                 maildir_path=opts.maildir_path,
                 maildir_create=opts.maildir_create,
@@ -1589,98 +2999,352 @@ def _main():
             exit(1)
 
     if mailbox_connection:
+        mailbox_batch_size_value = (
+            int(opts.mailbox_batch_size) if opts.mailbox_batch_size is not None else 10
+        )
+        mailbox_check_timeout_value = (
+            int(opts.mailbox_check_timeout)
+            if opts.mailbox_check_timeout is not None
+            else 30
+        )
+        mailbox_max_unsaved_retries_value = (
+            int(opts.mailbox_max_unsaved_retries)
+            if opts.mailbox_max_unsaved_retries is not None
+            else 2
+        )
+
+    def mailbox_save_callback(batch: ParsingResults) -> bool:
+        """Save one mailbox batch and report whether it actually landed.
+
+        Passed to ``get_dmarc_reports_from_mailbox()`` as ``save_callback``
+        and to ``watch_inbox()`` as its ``callback``. Returning ``False``
+        when any output destination failed keeps that batch's messages in
+        the mailbox to be retried, instead of archiving or deleting reports
+        that were never persisted anywhere (#242). With
+        ``fail_on_output_error`` enabled it never returns ``False``:
+        ``process_reports()`` raises ``ParserError`` instead, which the
+        library treats as "unsaved" too (same retention and retry-cap
+        bookkeeping) before the exception propagates back out here.
+        """
+        return not process_reports(batch)
+
+    if mailbox_connection and not _shutdown_requested:
         try:
-            logger.info("Fetching reports from mailbox...")
             reports = get_dmarc_reports_from_mailbox(
                 connection=mailbox_connection,
                 delete=opts.mailbox_delete,
-                batch_size=opts.mailbox_batch_size,
+                delete_aggregate=opts.mailbox_delete_aggregate,
+                delete_failure=opts.mailbox_delete_failure,
+                delete_smtp_tls=opts.mailbox_delete_smtp_tls,
+                delete_invalid=opts.mailbox_delete_invalid,
+                batch_size=mailbox_batch_size_value,
                 reports_folder=opts.mailbox_reports_folder,
                 archive_folder=opts.mailbox_archive_folder,
-                ip_db_path=opts.ip_db_path,
-                always_use_local_files=opts.always_use_local_files,
-                reverse_dns_map_path=opts.reverse_dns_map_path,
-                reverse_dns_map_url=opts.reverse_dns_map_url,
-                offline=opts.offline,
-                nameservers=opts.nameservers,
                 test=opts.mailbox_test,
-                strip_attachment_payloads=opts.strip_attachment_payloads,
                 since=opts.mailbox_since,
-            )
-            
-            logger.info(
-                "Fetched %d aggregate, %d forensic, and %d SMTP TLS reports from mailbox.",
-                len(reports["aggregate_reports"]),
-                len(reports["forensic_reports"]),
-                len(reports["smtp_tls_reports"]),
+                config=parser_config,
+                n_procs=n_procs,
+                save_callback=mailbox_save_callback,
+                max_unsaved_retries=mailbox_max_unsaved_retries_value,
             )
 
             aggregate_reports += reports["aggregate_reports"]
-            forensic_reports += reports["forensic_reports"]
+            failure_reports += reports["failure_reports"]
             smtp_tls_reports += reports["smtp_tls_reports"]
 
+        except ParserError as error:
+            # fail_on_output_error turns a failed batch save into a
+            # ParserError inside mailbox_save_callback; it reaches here
+            # through get_dmarc_reports_from_mailbox, which leaves the
+            # batch's messages in the mailbox on its way out.
+            logger.error(error.__str__())
+            sys.exit(1)
+        except (ClientAuthenticationError, APIError, httpx.HTTPError) as error:
+            if msgraph_connection is None:
+                logger.exception("Mailbox Error")
+            else:
+                _log_msgraph_failure(
+                    error,
+                    stage="mailbox fetch",
+                    mailbox=opts.graph_mailbox or opts.graph_user,
+                    tenant_id=opts.graph_tenant_id,
+                    auth_method=opts.graph_auth_method,
+                )
+            exit(1)
         except Exception:
             logger.exception("Mailbox Error")
             exit(1)
 
-    results = OrderedDict(
-        [
-            ("aggregate_reports", aggregate_reports),
-            ("forensic_reports", forensic_reports),
-            ("smtp_tls_reports", smtp_tls_reports),
-        ]
+    # Filtered here rather than relying on process_reports()'s in-place
+    # filtering: the dicts it filters are the file snapshot and the mailbox
+    # batches, not this combined dict, which exists only to feed
+    # email_results() / email_results_via_msgraph() below.
+    parsing_results: ParsingResults = {
+        "aggregate_reports": aggregate_reports,
+        "failure_reports": failure_reports,
+        "smtp_tls_reports": filter_smtp_tls_reports_for_index_prefix(smtp_tls_reports),
+    }
+
+    file_results_nonempty = bool(
+        file_parsing_results["aggregate_reports"]
+        or file_parsing_results["failure_reports"]
+        or file_parsing_results["smtp_tls_reports"]
     )
-
-    process_reports(results)
-
-    if opts.smtp_host:
+    # Mailbox-derived reports were already saved by mailbox_save_callback;
+    # only file/mbox-derived reports are left to save here. With a mailbox
+    # connection and nothing from files, skip the call entirely so the run
+    # doesn't print a second, empty JSON blob.
+    if file_results_nonempty or not mailbox_connection:
         try:
-            logger.info("Emailing results to %s...", ", ".join(opts.smtp_to))
+            process_reports(file_parsing_results)
+        except ParserError as error:
+            logger.error(error.__str__())
+            sys.exit(1)
+
+    smtp_to_value = (
+        list(opts.smtp_to)
+        if isinstance(opts.smtp_to, list)
+        else _str_to_list(str(opts.smtp_to))
+    )
+    has_reports = bool(
+        parsing_results["aggregate_reports"]
+        or parsing_results["failure_reports"]
+        or parsing_results["smtp_tls_reports"]
+    )
+    if not has_reports and (
+        opts.smtp_host or (msgraph_connection is not None and smtp_to_value)
+    ):
+        logger.info("No reports were parsed; skipping the results email")
+    elif opts.smtp_host:
+        try:
             verify = True
             if opts.smtp_skip_certificate_verification:
                 verify = False
+            smtp_port_value = int(opts.smtp_port) if opts.smtp_port is not None else 25
             email_results(
-                results,
+                parsing_results,
                 opts.smtp_host,
                 opts.smtp_from,
-                opts.smtp_to,
-                port=opts.smtp_port,
+                smtp_to_value,
+                port=smtp_port_value,
                 verify=verify,
                 username=opts.smtp_user,
                 password=opts.smtp_password,
                 subject=opts.smtp_subject,
                 require_encryption=opts.smtp_ssl,
+                attachment_filename=opts.smtp_attachment,
+                message=opts.smtp_message,
             )
         except Exception:
             logger.exception("Failed to email results")
-
+            exit(1)
+    elif msgraph_connection is not None and smtp_to_value:
+        try:
+            email_results_via_msgraph(
+                parsing_results,
+                msgraph_connection,
+                smtp_to_value,
+                subject=opts.smtp_subject,
+                attachment_filename=opts.smtp_attachment,
+                message=opts.smtp_message,
+            )
+        except (ClientAuthenticationError, APIError, httpx.HTTPError) as error:
+            _log_msgraph_failure(
+                error,
+                stage="message send",
+                mailbox=opts.graph_mailbox or opts.graph_user,
+                tenant_id=opts.graph_tenant_id,
+                auth_method=opts.graph_auth_method,
+            )
+            exit(1)
+        except Exception:
+            logger.exception("Failed to email results via Microsoft Graph")
             exit(1)
 
     if mailbox_connection and opts.mailbox_watch:
-        logger.info("Watching for email - Quit with ctrl-c")
+        logger.info("Watching for email - Ctrl-C once to quit, twice to force")
 
-        try:
-            watch_inbox(
-                mailbox_connection=mailbox_connection,
-                callback=process_reports,
-                reports_folder=opts.mailbox_reports_folder,
-                archive_folder=opts.mailbox_archive_folder,
-                delete=opts.mailbox_delete,
-                test=opts.mailbox_test,
-                check_timeout=opts.mailbox_check_timeout,
-                nameservers=opts.nameservers,
-                dns_timeout=opts.dns_timeout,
-                strip_attachment_payloads=opts.strip_attachment_payloads,
-                batch_size=opts.mailbox_batch_size,
-                ip_db_path=opts.ip_db_path,
-                always_use_local_files=opts.always_use_local_files,
-                reverse_dns_map_path=opts.reverse_dns_map_path,
-                reverse_dns_map_url=opts.reverse_dns_map_url,
-                offline=opts.offline,
-            )
-        except FileExistsError as error:
-            logger.error("{0}".format(error.__str__()))
-            exit(1)
+        while True:
+            # Re-check mailbox_watch in case a config reload disabled watch mode
+            if not opts.mailbox_watch:
+                logger.info(
+                    "Mailbox watch disabled in reloaded configuration, stopping watcher"
+                )
+                break
+            try:
+                # `config_reloading` returns True on SIGHUP (reload) or
+                # SIGTERM/SIGINT (shutdown); the backend polls it between
+                # checks — including inside the IMAP IDLE loop — and returns
+                # at a safe boundary once the current batch is processed.
+                watch_inbox(
+                    mailbox_connection=mailbox_connection,
+                    callback=mailbox_save_callback,
+                    reports_folder=opts.mailbox_reports_folder,
+                    archive_folder=opts.mailbox_archive_folder,
+                    delete=opts.mailbox_delete,
+                    delete_aggregate=opts.mailbox_delete_aggregate,
+                    delete_failure=opts.mailbox_delete_failure,
+                    delete_smtp_tls=opts.mailbox_delete_smtp_tls,
+                    delete_invalid=opts.mailbox_delete_invalid,
+                    test=opts.mailbox_test,
+                    check_timeout=mailbox_check_timeout_value,
+                    batch_size=mailbox_batch_size_value,
+                    since=opts.mailbox_since,
+                    config=parser_config,
+                    config_reloading=lambda: _reload_requested or _shutdown_requested,
+                    n_procs=n_procs,
+                    max_unsaved_retries=mailbox_max_unsaved_retries_value,
+                )
+            except FileExistsError as error:
+                logger.error(f"{error.__str__()}")
+                exit(1)
+            except ParserError as error:
+                logger.error(error.__str__())
+                exit(1)
+            except (ClientAuthenticationError, APIError, httpx.HTTPError) as error:
+                if msgraph_connection is None:
+                    logger.exception("Mailbox Error")
+                else:
+                    _log_msgraph_failure(
+                        error,
+                        stage="mailbox watch",
+                        mailbox=opts.graph_mailbox or opts.graph_user,
+                        tenant_id=opts.graph_tenant_id,
+                        auth_method=opts.graph_auth_method,
+                    )
+                exit(1)
+
+            # Prioritize shutdown over reload if both flags are set (e.g.
+            # SIGHUP followed by SIGTERM). atexit closes output clients.
+            if _shutdown_requested:
+                logger.info("Shutdown requested, exiting watch loop")
+                break
+
+            if not _reload_requested:
+                break
+
+            # Reload configuration — emit the log message here (not in the
+            # signal handler, which is not async-signal-safe), then clear the
+            # flag so that any new SIGHUP arriving while we reload will be
+            # captured for the next iteration rather than being silently dropped.
+            logger.info("SIGHUP received, config will reload after current batch")
+            _reload_requested = False
+            logger.info("Reloading configuration...")
+            try:
+                # Build a fresh opts starting from CLI-only defaults so that
+                # sections removed from the config file actually take effect.
+                new_opts = Namespace(**vars(opts_from_cli))
+                new_config = _load_config(config_file)
+                new_index_prefix_domain_map = _parse_config(new_config, new_opts)
+                new_clients = _init_output_clients(
+                    new_opts, index_prefix_domain_map=new_index_prefix_domain_map
+                )
+
+                # All steps succeeded — commit the changes atomically.
+                _close_output_clients(clients)
+                clients = new_clients
+                index_prefix_domain_map = new_index_prefix_domain_map
+
+                # Reload the reverse DNS map so changes to the
+                # map path/URL in the config take effect. PSL overrides
+                # are reloaded alongside it so map entries that depend on
+                # a folded base domain keep working.
+                load_reverse_dns_map(
+                    REVERSE_DNS_MAP,
+                    always_use_local_file=new_opts.always_use_local_files,
+                    local_file_path=new_opts.reverse_dns_map_path,
+                    url=new_opts.reverse_dns_map_url,
+                    offline=new_opts.offline,
+                    psl_overrides_path=new_opts.psl_overrides_path,
+                    psl_overrides_url=new_opts.psl_overrides_url,
+                )
+
+                # Reload the IP database so changes to the
+                # db path/URL in the config take effect.
+                load_ip_db(
+                    always_use_local_file=new_opts.always_use_local_files,
+                    local_file_path=new_opts.ip_db_path,
+                    url=new_opts.ipinfo_url,
+                    offline=new_opts.offline,
+                )
+
+                # Re-apply IPinfo API settings. Passing a falsy token disables
+                # the API; a rotated token picks up here too. An invalid token
+                # is fatal even on reload — the operator asked for it.
+                try:
+                    configure_ipinfo_api(
+                        new_opts.ipinfo_api_token if not new_opts.offline else None,
+                    )
+                except InvalidIPinfoAPIKey as e:
+                    logger.critical(str(e))
+                    exit(1)
+
+                for k, v in vars(new_opts).items():
+                    setattr(opts, k, v)
+
+                parser_config = _build_parser_config(opts)
+
+                # Update watch parameters from reloaded config
+                mailbox_batch_size_value = (
+                    int(opts.mailbox_batch_size)
+                    if opts.mailbox_batch_size is not None
+                    else 10
+                )
+                mailbox_check_timeout_value = (
+                    int(opts.mailbox_check_timeout)
+                    if opts.mailbox_check_timeout is not None
+                    else 30
+                )
+                mailbox_max_unsaved_retries_value = (
+                    int(opts.mailbox_max_unsaved_retries)
+                    if opts.mailbox_max_unsaved_retries is not None
+                    else 2
+                )
+
+                # Update log level
+                logger.setLevel(logging.ERROR)
+                if opts.warnings:
+                    logger.setLevel(logging.WARNING)
+                if opts.verbose:
+                    logger.setLevel(logging.INFO)
+                if opts.debug:
+                    logger.setLevel(logging.DEBUG)
+
+                # Refresh FileHandler if log_file changed
+                old_log_file = getattr(opts, "active_log_file", None)
+                new_log_file = opts.log_file
+                if old_log_file != new_log_file:
+                    # Remove old FileHandlers
+                    for h in list(logger.handlers):
+                        if isinstance(h, logging.FileHandler):
+                            h.close()
+                            logger.removeHandler(h)
+                    # Add new FileHandler if configured
+                    if new_log_file:
+                        try:
+                            fh = logging.FileHandler(new_log_file, "a")
+                            file_formatter = logging.Formatter(
+                                "%(asctime)s - %(levelname)s"
+                                " - [%(filename)s:%(lineno)d] - %(message)s"
+                            )
+                            fh.setFormatter(file_formatter)
+                            logger.addHandler(fh)
+                        except Exception as log_error:
+                            logger.warning(f"Unable to write to log file: {log_error}")
+                    opts.active_log_file = new_log_file
+
+                _configure_dependency_logging(logger.level)
+
+                logger.info("Configuration reloaded successfully")
+            except Exception:
+                logger.exception(
+                    "Config reload failed, continuing with previous config"
+                )
+
+    # Close output clients on the success path (one-shot or graceful
+    # watch-loop exit). atexit-registered above is the safety net for
+    # exit(1) / uncaught-exception paths.
+    _close_output_clients(clients)
 
 
 if __name__ == "__main__":

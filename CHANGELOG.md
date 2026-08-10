@@ -1,13 +1,673 @@
-Changelog
-=========
+# Changelog
 
-8.18.7
-------
+## 10.4.1
+
+### Bug fixes
+
+- **The automatic `dkim_results_combined`/`spf_results_combined` and `policies_combined`/`failure_details_combined` backfills now cover the indexes named by `index_prefix_domain_map` and by a previous `index_suffix`** ([#868](https://github.com/domainaware/parsedmarc/issues/868)). The startup migration derived its Elasticsearch/OpenSearch index names from the `[elasticsearch]`/`[opensearch]` `index_prefix`/`index_suffix` options alone, while the save path honors `index_prefix_domain_map` as well. In a multi-tenant deployment whose per-tenant prefixes come from that map — with no `index_prefix` set, as the multi-tenant documentation instructs — the guard `count` therefore ran against `dmarc_aggregate*`/`smtp_tls*`, patterns that match none of the real `<tenant>_dmarc_aggregate-*` indexes. Since the query passes `allow_no_indices=True`, a zero-match wildcard returns a count of 0, which is indistinguishable from "already backfilled", so the backfill was skipped **silently, with no log line at any level**, leaving the 10.4.0 dashboards' "DKIM details" table empty and every "SPF details" row labelled `none`. The migration now targets one index name per tenant prefix in the map — normalized by the same helper the save path uses, so the two cannot drift — plus the unprefixed name, since aggregate and failure reports for a domain that is absent from the map are still saved without a prefix and every report type may have indexes predating the map. A configured `index_prefix` still wins outright and suppresses the fan-out, matching save-time precedence, so such a deployment never submits an `_update_by_query` against an index pattern it does not write to. The `index_suffix` axis is widened the same way: the unsuffixed pattern is now targeted alongside the suffixed one, so documents indexed before the suffix was configured are backfilled too — note that on a shared cluster the unsuffixed pattern also matches other deployments' suffixes. The resolved target index names are logged at debug level, and a `SIGHUP` configuration reload re-resolves them, so a newly onboarded tenant is covered without a restart. Finally, an `index_prefix_domain_map` YAML file that is not a mapping of tenant names to *lists* of domain names, all strings, is now rejected at startup with a `ConfigurationError`. Every other shape failed silently rather than loudly: a non-string key raised mid-save, a scalar value matched the wrong domains (`in` on a `str` is a substring test, so `"example.co" in "example.com"` is `True`), and a non-string list item such as `tenant_a: [42]` simply never compared equal to any domain.
+- **The legacy `published_policy.fo` index migration works again, and is back for Elasticsearch as well as OpenSearch.** parsedmarc releases before 5.0.0 declared that field as an integer, so their indexes mapped it as `long`, which cannot hold the multi-value `fo` settings reports carry (`0:1`, `d:s`); 5.0.0 both fixed the declaration and added a migration that rebuilds such an index as a `-v2` index with the text/keyword shape. That migration worked against the Elasticsearch 6 clusters of the day, but has been unable to complete since mapping types were removed from Elasticsearch 7 — and they never existed in OpenSearch — for two reasons: it read the field mapping in the old response shape that nests fields under a mapping type name, so the type check always fell through; and its `put_mapping()` call passed a `doc_type` argument that neither current client accepts, which would have raised `TypeError` if the check had ever passed. It now reads either response shape and uses each client's current `put_mapping()` signature. It is also retry-safe: an attempt interrupted between creating the `-v2` index and deleting the original used to leave debris that made every later startup fail on "resource already exists", so the index was never migrated; a leftover target is now discarded first, which is safe precisely because the original is only deleted once the reindex has succeeded. The whole migration is verified end to end against live Elasticsearch 8.19 and OpenSearch 3 clusters, including that recovery path. The index names it checks are also corrected: it takes exact names rather than wildcard patterns, because 5.0.0 introduced date-suffixed index names in the same release that fixed the declaration, so an affected index has no date component — but it *can* be prefixed or suffixed, since both options date back to 4.1.0, so the configured `index_prefix`/`index_suffix` are applied. As with the backfill, an `index_suffix` also gets the unsuffixed name checked, for history predating the suffix. `index_prefix_domain_map` prefixes are deliberately not applied, since that option arrived in 8.19.0, long after the mapping was fixed; this migration renames the index it rebuilds — documents are reindexed into the `-v2` index before the original is deleted, so none are lost, but the name changes — and so it must not be pointed at indexes belonging to a tenant it is not migrating. The Elasticsearch copy of the migration, removed as unreachable during the [#806](https://github.com/domainaware/parsedmarc/issues/806) client migration, is restored now that the cause is understood. Note that Elasticsearch 8 refuses to open an index created before 7.0, so an affected index reaches a supported cluster only by being carried forward through a reindex, which preserves the old mapping whenever the destination index is pre-created from it — the standard reindex procedure.
+
+## 10.4.0
+
+### New features
+
+- **`n_procs` parallel parsing now covers messages from mbox files and mailbox connections** ([#147](https://github.com/domainaware/parsedmarc/issues/147)), not just report files passed directly as CLI arguments: IMAP, Microsoft Graph, Gmail API, and Maildir connections, including watch mode. `get_dmarc_reports_from_mbox()`, `get_dmarc_reports_from_mailbox()`, and `watch_inbox()` all gained an `n_procs` keyword argument. Parallel workers are now a reused process pool for the whole run, with a bounded submission window that keeps at most roughly `2 * n_procs` messages in flight at a time so memory stays bounded even for huge mboxes; the main process sends periodic IMAP keepalives while workers parse.
+- **Added `ParserConfig`, a single frozen dataclass carrying every parsing/enrichment option** ([#503](https://github.com/domainaware/parsedmarc/issues/503)): offline mode, IP database path, reverse DNS map and PSL overrides paths/URLs, DNS nameservers/timeout/retries, `strip_attachment_payloads`, `normalize_timespan_threshold_hours`, and the three caches the parser and enrichment code share across calls (IP address info, seen aggregate report IDs, and the reverse DNS map). `parse_aggregate_report_xml()`, `parse_aggregate_report_file()`, `parse_failure_report()`, `parse_report_email()`, `parse_report_file()`, `get_dmarc_reports_from_mbox()`, `get_dmarc_reports_from_mailbox()`, and `watch_inbox()` all accept a keyword-only `config=` argument; when it's provided, the individual option keyword arguments are ignored in favor of the config's values, and every existing per-option keyword argument continues to work unchanged when `config=` is omitted. Every explicitly constructed `ParserConfig` owns fresh, isolated caches; omitting `config=` falls back to the existing process-wide shared default caches, unchanged and identity-preserved (`parsedmarc.IP_ADDRESS_CACHE`, `parsedmarc.SEEN_AGGREGATE_REPORT_IDS`, `parsedmarc.REVERSE_DNS_MAP`). Caches never cross multiprocessing worker boundaries: `ParserConfig.__getstate__` drops the three cache fields when a config is pickled for a worker, and each worker accumulates its own from that point on. `keep_alive` and `n_procs` remain separate keyword arguments — they control process/worker orchestration, not parsing or enrichment behavior, so they're deliberately not `ParserConfig` fields. See the new "Using parsedmarc as a library" section of the usage docs for an example.
+- **Added a "Domain policy" dropdown filter to the Splunk aggregate DMARC dashboard** ([#854](https://github.com/domainaware/parsedmarc/issues/854)): filters every panel on the published DMARC policy (`published_policy.p`) or subdomain policy (`published_policy.sp`), making it easy to see which domains with a `none` policy are ready to move to `quarantine` or `reject`. It sits immediately before the "Message disposition" dropdown and offers the same choices (`any`/`none`/`quarantine`/`reject`, defaulting to `any`).
+- **New `[mailbox]` options `delete_aggregate`, `delete_failure`, `delete_smtp_tls`, and `delete_invalid`** ([#256](https://github.com/domainaware/parsedmarc/issues/256)): control message deletion per report type instead of all-or-nothing. Each defaults to the value of the overall `delete` option, so existing configurations behave exactly as before; set one to override just that type — for example `delete = True` with `delete_failure = False` deletes processed aggregate and SMTP TLS report messages while archiving failure report messages. `delete_invalid` covers messages that could not be parsed, so they can be kept in the `Invalid` archive subfolder for debugging even when everything else is deleted. `get_dmarc_reports_from_mailbox()` and `watch_inbox()` gained matching `delete_aggregate`, `delete_failure`, `delete_smtp_tls`, and `delete_invalid` keyword arguments, where `None` (the default) means "inherit `delete`". The mutual exclusion between deletion and `test` mode is now evaluated against the effective per-type flags: any type that would be deleted still raises a `ValueError` alongside `test`, but `delete = True` with all four per-type options explicitly `False` is now valid with `test` enabled, since nothing would be deleted.
+- **New `[mailbox]` option `max_unsaved_retries`** (default `2`): how many times a batch of messages whose reports could not be saved is retried before its messages are moved to the `Unsaved` archive subfolder and stop being retried. `0` moves messages on the first failed save; negative values are rejected with a `ValueError`. Failures are counted in memory, per message and per process, so the cap applies across watch-mode checks within one long-running process rather than across separate one-shot runs. See the mailbox-persistence bug fix below for the full behavior; the cap is deliberately low because each retry re-delivers the batch to every output destination that does not deduplicate. `get_dmarc_reports_from_mailbox()` and `watch_inbox()` gained a matching `max_unsaved_retries` keyword argument.
+- **New `[general]` option `archive_directory`**: move successfully processed local report files into a dated archive tree (`<archive_directory>/<year>/<month>/<Aggregate|Failure|SMTP-TLS>/`); files that fail to parse as a report go to `<archive_directory>/Invalid/`, while files that fail for other reasons (e.g. transient I/O errors) are left in place so a later run can retry them; existing files are never overwritten (numeric suffix); files already under the archive directory are excluded from later runs. Applies only to report files passed directly as local path arguments ([#570](https://github.com/domainaware/parsedmarc/issues/570)).
+
+### Changes
+
+- **The DMARC pass/fail pie chart and over-time chart are now named for DMARC compliance** in the OpenSearch Dashboards/Kibana and Splunk dashboards and the Elasticsearch-backed Grafana dashboard (the PostgreSQL Grafana variant has no pass/fail charts and is unchanged): "DMARC compliance" and "DMARC compliance over time" ("DMARC Compliance" / "DMARC Compliance Over Time" in Grafana, which title-cases panel names), replacing the previous mix of "Passed DMARC", "DMARC Passage", and "DMARC passage over time". This matches the existing "% DMARC Compliant" table column and the "Message volume and DMARC compliance by from domain" panels. The Splunk dashboard's pass/fail filter dropdown label was renamed to "DMARC compliant" to match.
+- **The Grafana dashboard's Guide panel walkthrough now matches the current panel layout**, directing readers to the "Top 2000 Message Sources by Reverse DNS" and "Message volume and DMARC compliance by from domain" tables and describing the compliance percentage they show, replacing stale references to a from-domain list "on the right" and a "Message From Header" table that no longer exists.
+- **`get_dmarc_reports_from_mailbox()` gained an optional keyword-only `save_callback` parameter**, invoked once per fetched batch with a `ParsingResults` dict holding only that batch's newly parsed reports, after parsing but before any of the batch's messages are deleted or moved out of `reports_folder`. Returning `False` reports the batch as unsaved: its messages stay in place for retry and the aggregate-report dedup cache is not updated for that batch, so the retry reparses those reports rather than skipping them as duplicates. Raising counts as an unsaved batch too — the same retention and `max_unsaved_retries` bookkeeping runs — and the exception is then re-raised, so a callback that fails by raising (the CLI's does, under `fail_on_output_error`) is still bounded by the retry cap even when the caller's watch loop swallows the exception, as mailsuite's IMAP and Maildir backends do. Any other return value, including `None`, commits the batch exactly as before, which is what `save_callback=None` (the default) does for every batch. As a related, strictly safer side effect of staging the dedup keys per batch, a mid-batch crash now leaves `SEEN_AGGREGATE_REPORT_IDS` unmodified for that batch instead of partially populated.
+- **`watch_inbox()`'s `callback` is now passed through as `save_callback`**, so it runs once per batch *before* that batch is archived or deleted, with only that batch's reports, rather than once afterward with the whole check's accumulated results. It may return `False` to defer a batch to the next check.
+- **A single-shot CLI run configured with both file/mbox inputs and a mailbox connection now emits output in two passes instead of one**: mailbox-derived reports are saved through the new `save_callback` before `get_dmarc_reports_from_mailbox()` returns, and file/mbox-derived reports are saved in a second pass afterward. `append_json`/`append_csv` are already append-safe and watch mode already called its callback repeatedly, so this changes how often output happens in the single-shot case, not what is written. When a mailbox connection is configured and the file/mbox inputs yielded no reports (none given, or none parsed), the second pass is skipped entirely rather than printing an empty JSON document.
+
+### Bug fixes
+
+- **Mailbox messages are no longer archived or deleted until the output destinations confirm the reports were saved** ([#242](https://github.com/domainaware/parsedmarc/issues/242)). Previously `get_dmarc_reports_from_mailbox()` archived or deleted every successfully parsed message *before* the CLI wrote anything to Elasticsearch/OpenSearch/Splunk/S3/Kafka/PostgreSQL/etc., so an output outage meant the report was never persisted anywhere while its source message was already gone from the reports folder, with no way to recover it. Each batch is now written to every configured destination first; if any destination fails, the whole batch's messages stay in the reports folder and are retried on the next run or watch-mode check. This is all-or-nothing per batch (archiving on partial success would still permanently lose the data for whichever destination failed) and applies independently of `fail_on_output_error`, which only controls the process exit code. Unparseable messages carry no report data and are still filed under `Invalid` (or deleted per `delete_invalid`) as before. To bound re-delivery to destinations that do not deduplicate, a message whose batch has failed `max_unsaved_retries + 1` times (three by default) is moved to `<archive_folder>/Unsaved` and stops being retried — never deleted, whatever the `delete` options say. Retries can produce duplicates in Kafka, Splunk HEC, syslog, GELF, webhooks, Azure Log Analytics, and the `--output` JSON/CSV files; Elasticsearch, OpenSearch, and PostgreSQL dedupe via `AlreadySaved`, and S3 overwrites the same key. Thanks to [@mkilijanek](https://github.com/mkilijanek) for the original implementation in [#823](https://github.com/domainaware/parsedmarc/pull/823).
+- **`extract_report()` now accepts plain uncompressed JSON.** The JSON magic-byte constant was written as `b"\7b"`, which Python reads as the octal escape `\7` (BEL, `0x07`) followed by a literal `b` — not `0x7B`, the `{` every RFC 8259 JSON object begins with — so the JSON branch never matched and plain JSON input was rejected as "Not a valid zip, gzip, json, or xml file". Every in-tree caller pre-guarded with its own zip/gzip or `{` check, which masked the dead branch; the practical impact was on `extract_report()` as a public API and on `application/tlsrpt+gzip` email attachments whose payload is actually uncompressed JSON. Now `b"\x7b"`.
+- **An SMTP TLS report with an empty `policies` list no longer crashes the CLI when `index_prefix_domain_map` is configured.** `parse_smtp_tls_report_json()` accepts an empty list, but `get_index_prefix()` unconditionally indexed `policies[0]`, raising `IndexError`. Such a report has no domain to map, so it is now treated as unmappable — excluded from prefix-mapped output like any other unmapped-domain report — instead of crashing.
+- **A failed `--output` file write no longer escapes uncaught.** `save_output()` was the only output destination the CLI did not wrap in a try/except, so a full disk or an unwritable output path crashed the run instead of being recorded like every other destination's failure. It is now caught and recorded as a `File output` error, which also means it correctly blocks mailbox archiving like any other failure.
+- **The emailed summary (`smtp_host` / Microsoft Graph) once again respects `index_prefix_domain_map` filtering of SMTP TLS reports.** `process_reports()` applies that filter in place to the dict it is given, and it is now given each mailbox batch and the file-derived snapshot rather than the combined results — so the combined dict passed to `email_results()` no longer inherited the filtering. It is filtered explicitly instead, so a configuration combining `index_prefix_domain_map` and an email destination excludes unmapped-domain SMTP TLS reports from the emailed summary, matching what was saved.
+- **Fixed the broken "XML files" link on the Splunk docs page**: it pointed at the old `splunk/` repository path instead of `dashboards/splunk/`, where the dashboards have lived since the `dashboards/` directory was introduced.
+- **A report file whose parsing raised an unexpected non-parser exception no longer hangs the CLI forever.** The old direct-file parallel implementation spawned a fresh child process per file and blocked the parent on a pipe read; a child that crashed with anything other than a `ParserError` never wrote to that pipe, so the parent waited indefinitely. The new implementation returns the error as a value and logs `Failed to parse <path>` instead.
+- **Direct-file parallel parsing no longer stalls a whole batch on one slow file, and no longer spawns a fresh interpreter per file.** The old implementation processed files in hard batches of `n_procs`, so a single slow file delayed every other file in its batch; the new pooled-worker implementation streams files through a reused pool instead.
+- **A one-shot mailbox run (no `--watch`) now honors `[general] dns_timeout` and `dns_retries`** ([#503](https://github.com/domainaware/parsedmarc/issues/503)). The CLI's call to `get_dmarc_reports_from_mailbox()` never forwarded those two options, so every one-shot mailbox run silently used the library's own hardcoded default (`dns_timeout=6.0`, `dns_retries=0`) regardless of what the operator configured; watch-mode runs were unaffected since the `watch_inbox()` call site did pass them. The CLI now builds a single `ParserConfig` per run (via the new `_build_parser_config()` helper) from parsed options and passes it as `config=` to every parsing entry point — the direct-file, mbox, one-shot mailbox, and watch call sites, plus the SIGHUP config-reload path — instead of forwarding option keyword arguments by hand at each call site.
+- **Lazily-triggered reverse DNS map loads no longer silently clobber configured PSL overrides with the bundled defaults** ([#503](https://github.com/domainaware/parsedmarc/issues/503)). `get_ip_address_info()` and `get_service_from_reverse_dns_base_domain()` load the reverse DNS map on first use rather than eagerly (this also happens independently in each `n_procs` worker process, since a worker starts with an empty map), and `load_reverse_dns_map()` reloads `psl_overrides.txt` at the same time so map entries that depend on the current overrides fold correctly. That reload previously called `load_psl_overrides()` with no path/URL arguments, so the first lazy map load in a run overwrote any operator-configured PSL overrides file with the bundled defaults. `get_ip_address_info()` and `get_service_from_reverse_dns_base_domain()` now accept `psl_overrides_path`/`psl_overrides_url` parameters and thread them through to `load_reverse_dns_map()`, so a lazy load applies the same configured overrides an eager one would.
+- **`get_dmarc_reports_from_mailbox()` and `watch_inbox()`'s `dns_timeout` default changed from a stray `6.0` to `DEFAULT_DNS_TIMEOUT`** (2.0 seconds, `parsedmarc/constants.py`), matching every other parsing entry point; `normalize_timespan_threshold_hours` also now defaults to the float `24.0` on both, rather than the int `24`. This is a minor behavior change for library callers who invoke either function directly without passing `dns_timeout`: DNS queries now time out after 2 seconds by default instead of 6, matching `parse_report_file()` and the CLI's own default.
+
+## 10.3.0
+
+### New features
+
+- **Added a per-domain DMARC compliance percentage to the aggregate dashboards of every provider** ([#112](https://github.com/domainaware/parsedmarc/issues/112)): OpenSearch Dashboards/Kibana, Grafana Elasticsearch, Grafana PostgreSQL, and Splunk. The from-domain volume table on each dashboard is now "Message volume and DMARC compliance by from domain", with columns for From Domain, Messages, and % DMARC Compliant.
+  - On OpenSearch Dashboards/Kibana, the table is now a TSVB visualization using a Filter Ratio metric (passed messages over total messages per `header_from`), since the previous agg-based data table can't compute a per-domain ratio. Editing the imported visualization on Kibana 8.x requires first enabling the `metrics:allowStringIndices` advanced setting.
+- **Directory paths are now accepted as `file_path` CLI arguments** ([#397](https://github.com/domainaware/parsedmarc/issues/397)): a directory expands to the report files inside it using shell-glob semantics (dotfile entries excluded, subdirectories skipped by default), and the new `-r`/`--recursive` flag descends into subdirectories and enables `**` recursion in glob patterns.
+
+### Changes
+
+- **Updated the pinned dev-tooling versions and converted the codebase to f-strings**: `ruff` 0.15.21 → 0.16.0 and `pyright` 1.1.410 → 1.1.411 in the `[build]` extra. All `str.format()` calls were converted to f-strings (ruff rules `UP030`/`UP032`), except where the f-string form would require Python 3.12's quote reuse inside expressions — those keep `.format()` with the redundant positional indices removed. Because ruff 0.16.0 greatly expanded its default lint rule set (adding rule families such as `BLE`, `SIM`, `C4`, `DTZ`, and import sorting, some of which conflict with deliberate house style — e.g. `BLE001` flags the parser's intentional broad catches), `[tool.ruff.lint]` now selects its rule set explicitly: the pre-0.16 defaults (`E4`/`E7`/`E9`/`F`) plus the modern-type-hint and f-string `UP` rules. Adopting any of the newly-default rule families is left as a deliberate future per-family decision. Alongside the conversion, a few pre-existing string defects the conversion surfaced were cleaned up: log/exception messages that embedded runs of indentation whitespace via backslash line continuations (and one missing sentence separator in the `since`-option warning) now read cleanly, and the Splunk HEC output builds its newline-delimited payload by joining a list instead of repeated string concatenation. No functional behavior changes.
+
+### Bug fixes
+
+- **The Elasticsearch/OpenSearch aggregate dashboards' over-time charts (and the Grafana ES dashboard's summary pies and time series) bucketed on the multi-valued `date_range` field**; a date histogram counts a report once per value, double-counting any report whose begin and end dates fall in different buckets. All date histograms and time-range filters now use the single-valued `date_begin`, matching the report-begin semantics of the PostgreSQL (`begin_date`) and Splunk (`_time` = interval begin) dashboards.
+- **Aggregate-report policy and authentication result words are now normalized to lowercase** ([#288](https://github.com/domainaware/parsedmarc/issues/288)): reporters that emit mixed-case values such as `Pass` no longer create duplicate result categories in outputs and dashboards.
+- **The results email (SMTP and Microsoft Graph) is no longer sent when no reports were parsed** ([#200](https://github.com/domainaware/parsedmarc/issues/200)): previously an empty run — an empty inbox, or one where every message was invalid — still emailed a zip of headers-only CSVs. The email step is now skipped with an INFO log when the run produced no aggregate, failure, or SMTP TLS reports.
+- **The DKIM/SPF alignment-detail tables on the Kibana/OpenSearch Dashboards, Grafana (Elasticsearch), and Splunk aggregate dashboards no longer show a selector × domain × result cross-product** ([#169](https://github.com/domainaware/parsedmarc/issues/169)). Elasticsearch/OpenSearch flatten the `dkim_results`/`spf_results` object arrays (they are dynamic-mapped as `object`, not `nested`), so stacking terms aggregations on their subfields produced every combination of selector/domain/result across a report's signatures, each repeating the full message count. Aggregate documents now also carry `dkim_results_combined` and `spf_results_combined` — one `"selector / domain / result"` (`"scope / domain / result"`) string per auth result — and the dashboards aggregate those instead; the Splunk detail panels now pair the values with `mvzip`/`mvexpand`. Documents saved by older versions are now backfilled automatically at startup (a non-blocking, idempotent background task); the documented `_update_by_query` command (see the Elasticsearch docs page) remains available for running the backfill manually. The Grafana "DKIM Alignment Details" panel's dmarcian.com DKIM-checker data link was removed because it required the separate domain/selector columns. The SMTP TLS visualizations had the same class of defect; that fix is described in its own entry below.
+- **The Kibana/OpenSearch Dashboards aggregate dashboard now includes an "Auth result filters" control panel** above the SPF/DKIM details tables, with dropdowns for DKIM selector/domain/result and SPF scope/domain/result, so results can still be filtered by individual components alongside the combined per-signature columns.
+- **SMTP TLS visualizations had the same cross-product defect as the DKIM/SPF alignment tables** ([#169](https://github.com/domainaware/parsedmarc/issues/169)): `policies` is an object array, and each policy's `failure_details` is itself an object array inside it, so stacking terms aggregations on their subfields cross-products the same way. SMTP TLS documents now also carry `policies_combined` — one `"policy_domain / policy_type"` string per policy — and `failure_details_combined` — one `"policy_domain / policy_type / result_type / sending_mta_ip / receiving_ip / receiving_mx_hostname"` string per failure detail — and documents saved by older versions are backfilled automatically at startup the same non-blocking, idempotent way as the DKIM/SPF backfill; the equivalent manual `_update_by_query` command is documented on the Elasticsearch docs page. Also fixed two adjacent dead fields found while making this change: `_SMTPTLSFailureDetailsDoc` declared `additional_information_uri`, but `add_failure_details` passed it to the constructor as `additional_information`, so it was never actually populated on the declared field; and `receiving_mx_hostname`, which `add_failure_details` has always stored, had no field declaration at all. Both are now correctly wired in the Elasticsearch and OpenSearch outputs.
+- **The Grafana "Map of Message Source Countries" panel's markers now scale with message volume and use a higher-contrast style.** Previously the markers were fixed-size 5 px dots at 50% opacity in dark green, which were nearly invisible on the dark basemap.
+- **Corrected the dead `_SPFResult.results` (plural) field declaration to `result`**, matching what was always written to it.
+- **An mbox-only run no longer shows a misleading, permanently-stuck `0it` progress bar, and mbox parsing now shows a real per-message progress bar on interactive terminals** ([#147](https://github.com/domainaware/parsedmarc/issues/147)). The CLI's progress bar only tracks report files passed directly as arguments — `n_procs` parallel parsing also only applies to those — so runs whose only input was an mbox file displayed an empty bar while messages were parsed sequentially with no visible progress (per-message progress is logged at INFO, hidden in `--silent`/config-file runs). The empty bar is no longer created, `get_dmarc_reports_from_mbox()` now wraps its message loop in a tqdm bar that auto-disables on non-TTY output, and the `n_procs` documentation now states the direct-file-arguments-only scope explicitly.
+
+## 10.2.4
+
+### Bug fixes
+
+- **Failure reports without a `message/feedback-report` part are no longer silently dropped by the Elasticsearch and OpenSearch outputs** ([#332](https://github.com/domainaware/parsedmarc/issues/332)). Some Exim/cPanel-based gateways send DMARC failure reports as `multipart/report` without a `report-type=feedback` parameter and without a machine-readable `message/feedback-report` part — only a plain-text summary starting with "A message claiming to be from you has failed". `parse_report_email()` has a dedicated fallback for this format that synthesizes a minimal feedback report containing only `Arrival-Date` and `Source-IP`, and `parse_failure_report()` already defaulted most missing fields — but not `feedback_type` or `authentication_results`, both of which the Elasticsearch/OpenSearch save paths access with hard key lookups. The result: every such report was parsed, archived to the failure folder, and then rejected at the sink with `Failure report missing required field: 'feedback_type'`, so it never reached the index. `parse_failure_report()` now defaults `feedback_type` to `auth-failure` (RFC 5965 §3.1) and `authentication_results` to `None` (RFC 6591 §3.1), each with a logged warning naming the offending omission — the same treatment the REQUIRED `Auth-Failure` and `Identity-Alignment` fields already receive. A sanitized sample (`samples/failure/exim_plain_text_only_no_arf_part.eml`) and a regression test asserting the sink-required keys are present cover the fallback path.
+- **The "Aggregate DMARC passage over time" and "Aggregate DMARC message disposition over time" OpenSearch Dashboards visualizations no longer default to a 12-hour X-axis interval** ([#828](https://github.com/domainaware/parsedmarc/issues/828)). Both `date_histogram` aggregations were configured with `"interval": "auto"`, which OpenSearch Dashboards sizes off the currently viewed time range rather than the data's actual cadence. Aggregate DMARC reports post one `date_range`-bucketed data point per reporting period (typically daily), so an auto-computed sub-day bucket size produced empty buckets and a misleading sawtooth/spike pattern. Both visualizations in `dashboards/opensearch/opensearch_dashboards.ndjson` now hardcode `"interval": "d"`, matching the fix the reporter applied manually in the visualization editor (the "Day" option in the interval picker). Per OpenSearch-Dashboards' `_interval_options.ts` and `parse_interval.ts` (`src/plugins/data/common/search/aggs/...`), the stored `interval` value must be a short duration-unit code (`ms`/`s`/`m`/`h`/`d`/`w`/`M`/`y`) or the literal `auto`; a spelled-out word like `"day"` fails `parseInterval`'s regex and throws `"day" is not a valid interval.` at render time, so `"d"` is required, not `"day"`.
+- **The same auto-interval time-bucketing bug from #828 also affected the PostgreSQL Grafana dashboard's "Over Time" panels** (`dashboards/grafana/Grafana-DMARC_Reports-PostgreSQL.json`): "SPF Results Over Time", "DKIM Results Over Time", "DMARC Pass/Fail Over Time", "Disposition Over Time", "SMTP TLS Sessions Over Time", and one unlabeled summary `stat` panel all grouped rows with `$__timeGroup(<column>, $__interval)`, where `$__interval` is a Grafana-computed value that scales with the panel's pixel width and the selected time range, not the reports' actual daily cadence (per the Grafana PostgreSQL query-editor macro docs). All 7 occurrences now hardcode the bucket width to `'1d'` (`$__timeGroup(rpt.begin_date, '1d')` / `$__timeGroup(tr.begin_date, '1d')`), matching the `fixed_interval: "1d"` already used by the equivalent panels in the companion Elasticsearch/Grafana dashboard (`Grafana-DMARC_Reports.json`), which was already correct and needed no change. The Elasticsearch/Grafana dashboard's non-time-series pie/stat/table panels that still use a `date_histogram` with `"fixed_interval": "auto"` were left as-is: they sum every bucket into a single value or list raw hits, so the bucket width has no visible effect there.
+- **The same bug also affected the Splunk "DMARC passage over time" and "Message disposition over time" panels** (`dashboards/splunk/dmarc_aggregate_dashboard.xml`). Both `| timechart` calls had no explicit `span`, so Splunk auto-computes a bin size targeting 100 buckets across whatever time range is selected; per Splunk's `timechart` documentation this only coincidentally lands on a 1-day span for the dashboard's default "last 7 days" time-range input; any other selected range (e.g. "last 24 hours" → 30 minutes) reproduces the same gapped/spiked chart. Both queries now set `span=1d` explicitly, per the Splunk docs' own guidance to use `span=1d` (not `span=24h`/`span=86400s`/`span=1440m`) for calendar-day boundaries.
+
+## 10.2.3
+
+### Changes
+
+- **Migrated the Elasticsearch output to the elasticsearch-py 8.x client** ([#806](https://github.com/domainaware/parsedmarc/issues/806)): the `elasticsearch-dsl` dependency is gone (the DSL is bundled in the client as `elasticsearch.dsl` since 8.18), and the new pin `elasticsearch>=8.18,<9` no longer forces `urllib3<2` — installs can now resolve urllib3 2.x. **Elasticsearch 7.x servers are no longer supported** (the 8.x client supports ES 8.x and 9.x servers). **OpenSearch users who were pointing the `[elasticsearch]` config section at an OpenSearch cluster must switch to the `[opensearch]` section** (the 8.x client's product check rejects OpenSearch). Also removed the dead ES 6-era `published_policy.fo` index migration in `migrate_indexes()` (unreachable via the 8.x client; the function remains as a no-op for API compatibility).
+- **The periodic summary email can now be sent via Microsoft Graph** (tracking [#472](https://github.com/domainaware/parsedmarc/issues/472)). Previously the summary email required `[smtp] host`, forcing M365 tenants that block legacy SMTP AUTH to stand up a separate SMTP relay just to send from the same mailbox they already read reports from. When `[smtp] host` is omitted and `[msgraph]` is configured, the summary is now sent through the same already-authenticated Graph mailbox connection (`/users/{mailbox}/sendMail`), saved to Sent Items. SMTP is preferred whenever `[smtp] host` is set, with no fallback to Graph on SMTP failure. `[smtp] host`/`user`/`password`/`from` are now conditionally required — only when `host` is present; `to` keeps its existing requirement either way. A new public `email_results_via_msgraph()` function shares its subject/message/zip-building logic with the existing `email_results()` via an extracted `_build_report_email_content()` helper, so both transports stay in lockstep. Note `[smtp] from` has no effect on the Graph path — the message's `From` is always the `[msgraph]` mailbox — and sending requires the Graph `Mail.Send` permission (`Mail.Send.Shared` for a shared mailbox under delegated auth); see the "Sending the summary email via Microsoft Graph" docs section for the full permission matrix.
+- **Microsoft Graph connection/fetch/send failures now log a single clear ERROR line** instead of a bare `logger.exception()` that hid the actual Azure/Graph error. The line identifies the mailbox, tenant ID, and auth method, and includes the Graph `request-id`/`client-request-id` when available (from the OData inner error or, failing that, the raw response headers) — details that matter when contacting Microsoft support. The full traceback is still preserved under `--debug`.
+- **Refreshed the `[msgraph]` documentation**: national/sovereign-cloud `graph_url` values with an explicit warning that the Entra ID auth endpoint isn't independently configurable, a minimal example config for every auth method, a reading-permission matrix alongside the existing sending one, an accurate note on the `parsedmarc`-named token cache (no migration needed — it's a deliberate backward-compatibility choice from the 9.11.0 `mailsuite` extraction, not something users have to act on), and a troubleshooting table distinguishing still-live failure modes (admin consent, uninitialized-mailbox folder resolution) from historical ones already fixed at this project's dependency floor (`Event loop is closed`, invalid ISO timestamps).
+- **All runtime HTTP calls now use `httpx` instead of `requests`**, and the dependency set changed accordingly: `requests` is no longer a runtime dependency (it moved to the `[build]` extra, where it's still used by the out-of-wheel maintainer script `parsedmarc/resources/maps/collect_domain_info.py`), and `httpx` and `microsoft-kiota-abstractions` are now declared dependencies (`httpx` for all runtime HTTP calls, `microsoft-kiota-abstractions` for the Microsoft Graph error handling above). The migration covers the webhook output client, the Splunk HEC client, and the PSL-overrides / IP-database / reverse-DNS-map / IPinfo-API fetches in `utils.py`. Redirect-following is preserved everywhere (`requests` follows redirects by default; `httpx` requires `follow_redirects=True`, which is now passed explicitly). The PSL-overrides and reverse-DNS-map fetches, which previously had no timeout, now time out after 60 seconds, matching the existing IP-database fetch. Also removed the module-level `urllib3.disable_warnings(InsecureRequestWarning)` call in the Splunk HEC output: `httpx` doesn't route through `urllib3`, so it no longer affected the HEC client, and its only remaining effect was globally silencing insecure-TLS warnings from every other `urllib3`-based component (Elasticsearch, OpenSearch, boto3) as an import side effect. With that gone, nothing imports `urllib3` directly anymore, so it's also no longer a declared dependency (it remains transitively installed).
+
+### Bug fixes
+
+- **`--watch` no longer crashes with a raw uncaught traceback on a Microsoft Graph error.** The continuous-mode loop previously caught only `FileExistsError`/`ParserError`; a Graph auth, API, or transport error during a long-running watch — arguably the most likely real-world failure point, since that's where token/certificate expiry actually surfaces — crashed uncaught. It now gets the same single formatted ERROR line as the other Graph call sites and exits cleanly.
+- **The documented `[smtp] attachment` and `[smtp] message` options are now honored.** Both were parsed into `opts.smtp_attachment`/`opts.smtp_message` but never passed to either summary-email transport, so a configured custom attachment filename or message body was silently ignored. Both the SMTP (`email_results()`) and Microsoft Graph (`email_results_via_msgraph()`) transports now receive them. Visible side effect: the default email body for SMTP summaries is now the long-documented default `Please see the attached DMARC results.` instead of the previously hardcoded `DMARC results for <date>`.
+
+## 10.2.2
+
+### Changes
+
+- Removed dead code found while extending test coverage: the unused `_SMTPTLSReportDoc.add_policy()` helpers in the Elasticsearch and OpenSearch outputs (the save paths construct policy documents directly), a no-op `failure_indexes` loop in both `migrate_indexes()` implementations (the parameter is still accepted; no failure-index migrations are currently needed), an unreachable `importlib.resources` ImportError fallback in `parsedmarc.utils` (it re-imported the same module, and `importlib.resources.files` always exists on the supported Python ≥3.10), and an unreachable "Invalid report content" guard in `extract_report()` (every input branch either assigns the file object or raises first, confirmed by pyright narrowing).
+
+### Bug fixes
+
+- **`parse_email()` no longer crashes with `KeyError: 'Headers'` on messages whose `From` header is present but empty/unparseable** (e.g. a bare `From:` line). mailparser omits `"from"` from `mail_json` for such messages, and the fallback read `parsed_email["Headers"]` — a key that is never set; the parsed headers are stored under lowercase `"headers"` (see the assignment at the top of `parse_email()`). The fallback now reads the correct key and treats an empty parsed header list the same as a missing header, yielding `from=None`.
+- **A failed IPinfo API token probe no longer logs "IPinfo API configured".** `configure_ipinfo_api(..., probe=True)` documents that non-fatal probe errors are logged as warnings with the token still accepted, but `_ipinfo_api_lookup()` returns `None` on network errors instead of raising, so the probe's exception handler never fired and a probe that couldn't reach the API logged the success message. The probe now checks the lookup result and logs a warning when verification failed. Invalid tokens (401/403) still raise `InvalidIPinfoAPIKey`.
+- **Aggregate-report record timestamps are no longer skewed by the host's UTC offset in the Elasticsearch, OpenSearch, and Splunk HEC outputs** ([#819](https://github.com/domainaware/parsedmarc/issues/819)). A record's `interval_begin`/`interval_end` are UTC wall-clock strings (converted to UTC at parse time), but the ES/OpenSearch save paths re-parsed them as local time, shifting the stored `date_begin`/`date_end` fields and the daily/monthly index date by the host's UTC offset on any non-UTC host, and the Splunk HEC output computed the aggregate event `time` the same way. The three call sites now pass `assume_utc=True`, the same treatment `arrival_date_utc` received in the #811 fix. The report-level `begin_date`/`end_date` parses (ES/OpenSearch dedup query, PostgreSQL output) were investigated and left unchanged — those strings are genuinely local time, so their existing round-trip is already correct.
+
+## 10.2.1
+
+### Changes
+
+- **Microsoft Graph connections are now observable** ([#814](https://github.com/domainaware/parsedmarc/issues/814)). Previously `--debug` showed nothing about Graph connection activity: the mailbox layer logs under `mailsuite.mailbox.graph`, token acquisition under `azure.identity`, and HTTP traffic under `httpx`/`msgraph` — none of which parsedmarc configured, so everything below WARNING was silently dropped, and `_main()` logged nothing around the connection attempt itself. Now:
+  - A **redacted connection summary** is logged at INFO before connecting (auth method, tenant ID, client ID, mailbox, Graph URL), with a `--debug` detail line adding the certificate path, token-file path, and set/not-set flags for secrets. Secret values (passwords, client secrets, certificate passwords, client assertions) are never logged, and a regression test asserts they don't appear in captured output.
+  - A timing line (`Microsoft Graph connection initialized in N seconds`) is logged after the connection object is created.
+  - parsedmarc's `--verbose`/`--debug` level now **propagates to the dependency loggers** (`mailsuite`, `azure`, `msgraph`, `httpx`, `httpcore`), so `--debug` surfaces azure-identity's token-endpoint activity — including the `AADSTS` error codes that distinguish a local config problem from an Exchange Online / Entra ID one — and the Graph SDK's HTTP requests. At the default level, dependency loggers sit at WARNING so their warnings keep surfacing (now formatted) without new noise. This also benefits the IMAP backend, which lives in mailsuite too.
+
+### Bug fixes
+
+- **Failure-report timestamps are no longer skewed by the host's UTC offset in the Elasticsearch, OpenSearch, and Splunk HEC outputs** ([#811](https://github.com/domainaware/parsedmarc/issues/811), bug 1). `arrival_date_utc` is a UTC wall-clock string, but the three sinks parsed it into a naive `datetime` and called `.timestamp()`, which per the Python docs interprets naive values as *local* time — so on any non-UTC host, the epoch stored as the ES/OpenSearch `arrival_date` field, used in the failure-report dedup query, and sent as the Splunk HEC event `time` was off by the host's UTC offset (1–2 h for most of Europe). `human_timestamp_to_datetime()` / `human_timestamp_to_unix_timestamp()` gained an `assume_utc` keyword that attaches `timezone.utc` to naive parses, and the `arrival_date_utc` consumers now use it.
+- **A system GeoIP file no longer silently overrides the bundled IPinfo database** ([#810](https://github.com/domainaware/parsedmarc/issues/810)). The IP database path resolution searched standard system paths (e.g. `/usr/share/GeoIP/GeoLite2-Country.mmdb`, plus CWD-relative names) *before* the database managed by parsedmarc, so on any host with a distro GeoIP package installed — often as a stale dependency of an unrelated package — every lookup used a country-only (and possibly years-old) database instead of the bundled IPinfo Lite database. That silently disabled ASN enrichment (`asn`, `as_name`, `as_domain` were `None` for every IP) and with it the ASN-fallback path into the reverse-DNS map. The precedence is now: explicit `ip_db_path` → the database selected by `load_ip_db()` (downloaded/cached/bundled) → the bundled copy → system paths as a true last resort. The selected database file is logged at debug level. **If you deliberately relied on the automatic system-path pickup to use MaxMind GeoLite2, set `ip_db_path` explicitly** — see the "Using MaxMind GeoLite2" section in the installation docs.
+
+## 10.2.0
+
+### Changes
+
+- **Invalid reports now explain *why* they are invalid.** The parser still catches broadly so one malformed report can never crash a batch, but the diagnostics are no longer a bare `Not a valid report`. `parse_report_file()` keeps each format parser's specific error as it tries aggregate XML → SMTP TLS JSON → report email, and when all three reject the input it sniffs the content shape to surface the single relevant reason — e.g. `Invalid aggregate report: Missing field: 'org_name'`, `Invalid SMTP TLS report: Missing required field: date-range`, or `Not a recognized report format (not a DMARC aggregate XML report, an SMTP TLS JSON report, or a DMARC report email)`. This is the message the CLI already logs (`Failed to parse <file> - <reason>`), so operators see the cause without a code change on their end.
+- **Original exceptions are now chained.** Every parser catch site re-raises with `raise … from <original>`, so the underlying `ExpatError`, `json.JSONDecodeError`, `KeyError`, and archive/decompression errors are preserved on `__cause__` for library callers and tracebacks instead of being flattened into a string. Behavior is otherwise unchanged — the same exception *types* are still raised.
+- **Unexpected errors cite their origin in debug mode.** When a catch-all branch turns an unforeseen exception into a generic `Unexpected error: …` / archive / mail-parse failure, the message now appends `(raised at <file>:<line>)` pinpointing the deepest traceback frame — but only when the `parsedmarc` logger is at `DEBUG` level (e.g. the CLI's `--debug`). Normal-level output is unchanged.
+- Added per-version `Programming Language :: Python :: 3.10`–`3.14` (and `3 :: Only`) trove classifiers so the PyPI page advertises the supported Python versions. No change to `requires-python` (`>=3.10`).
+
+### Bug fixes
+
+- **Fixed an `IndexError` when backfilling `envelope_from` from SPF results.** In `_parse_report_record()`, when an aggregate report's `<identifiers>` carried an empty `envelope_from`, the fallback checked the raw `auth_results["spf"]` list for length but then indexed the *filtered* `new_record["auth_results"]["spf"]` list (which only contains results that have a `domain`). A reporter that sent an SPF auth result with no `domain` made the filtered list empty while the raw list was non-empty, so the `[-1]` index raised `IndexError` and the whole record failed to parse. The two near-identical `envelope_from` backfill branches (one for a missing identifier, one for an empty one) are now a single code path that gates and indexes the same list, matching the already-correct missing-identifier branch.
+
+## 10.1.1
+
+### Changes
+
+- Require `mailsuite>=2.2.2.2` to  honor config reloading in the IMAP `IDLE` loop
+
+## 10.1.0
+
+### Changes
+
+- **Graceful shutdown on `SIGTERM` / `SIGINT`.** Previously `SIGTERM` (sent by `systemctl stop`, `docker stop`, and Kubernetes pod termination) killed the process mid-batch, tearing output writes and silently dropping Kafka producer buffers. parsedmarc now sets a shutdown flag that is polled at safe boundaries: the one-shot CLI checks it between batches, and the watcher passes it as `config_reloading` so the mailbox backend — including the IMAP `IDLE` loop — returns once the current batch is processed. Either way the current batch and its output writes finish before the process exits. Ctrl-C is a double-tap: the first press is graceful, the second short-circuits to `os._exit(130)`. This requires the `config_reloading`-aware IMAP IDLE loop from the pinned `mailsuite` fork; with a stock `mailsuite` the IDLE watcher cannot be interrupted cleanly. (PR #[794](https://github.com/domainaware/parsedmarc/pull/794))
+  - **Output clients are now closed on every exit path** via `atexit` plus a trailing close at the end of `_main()`, fixing a long-standing leak where one-shot CLI runs and graceful shutdowns never flushed Kafka / closed Elasticsearch / S3 / etc. clients.
+  - **Example systemd unit** in `docs/source/usage.md` now sets `KillSignal=SIGTERM` and `TimeoutStopSec=60` so systemd waits long enough for the watcher to drain (keep it above `mailbox_check_timeout`).
+- Switch the Kafka client dependency from `kafka-python-ng` back to `kafka-python>=2.3.2` ([#795](https://github.com/domainaware/parsedmarc/issues/795)). `kafka-python-ng` was a fork created while `kafka-python` was unmaintained; upstream `kafka-python` is active again, and the now-archived fork is vulnerable to [CVE-2026-10142](https://nvd.nist.gov/vuln/detail/CVE-2026-10142) and [CVE-2026-10143](https://nvd.nist.gov/vuln/detail/CVE-2026-10143), both fixed in `kafka-python` 2.3.2. Both packages install the same `kafka` module, so if you are upgrading an existing environment in place with `pip`, run `pip uninstall kafka-python-ng` before upgrading parsedmarc so the two distributions don't conflict with each other's files.
+  - parsedmarc is compatible with both `kafka-python` 2.3.2+ and 3.x: `kafka-python` 3.0 removed the `NoBrokersAvailable` exception (a failed bootstrap now raises `KafkaTimeoutError`), and parsedmarc handles whichever the installed version provides.
+- The whole codebase (library and tests) now passes `pyright` with zero errors and warnings, and CI enforces this (plus `ruff format --check`) on every push and pull request. Pyright is configured in `pyproject.toml` (`[tool.pyright]`) and pinned in the `[build]` extra. The fixes are annotation-level only (`Optional` parameters, TypedDict-aware signatures on the syslog/GELF save methods, `TYPE_CHECKING`-aware optional imports for `psycopg` and the `kafka-python` 2.x/3.x bootstrap-error fallback) — runtime behavior is unchanged apart from the `SyslogClient` fix below. Builds on the class-body alias declarations from [#797](https://github.com/domainaware/parsedmarc/pull/797).
+
+### Bug fixes
+
+- `SyslogClient`: constructing a TCP/TLS client with `retry_attempts` < 1 now raises `ValueError` instead of silently skipping the connection loop and registering a broken (`None`) log handler.
+
+## 10.0.4
+
+### Docker
+
+- **PostgreSQL backend in the prebuilt image** ([#792](https://github.com/domainaware/parsedmarc/issues/792)): the image now installs `parsedmarc[postgresql]`, so the optional PostgreSQL output backend (`psycopg`) works out of the box in the container without a separate `pip install`.
+- **`arm64` images** ([#789](https://github.com/domainaware/parsedmarc/issues/789)): the release workflow now builds and publishes a multi-arch manifest for `linux/amd64` and `linux/arm64`, so `ghcr.io/domainaware/parsedmarc` runs natively on 64-bit ARM hosts such as a Raspberry Pi. All compiled dependencies (`psycopg[binary]`, `lxml`, `maxminddb`, `cryptography`) ship prebuilt `aarch64` wheels, so the build adds no source-compilation step.
+
+## 10.0.3
+
+### Bug fixes
+
+- Fix `Reply-To` (and `Delivered-To`) addresses being dropped from failure-report samples. `parse_email()` looked up mailparser's underscored `reply_to` / `delivered_to` keys, but `mail_json` names those headers `reply-to` / `delivered-to`, so the lookup always missed and `parsed_sample["reply_to"]` was always `[]` regardless of the message. Failure samples now carry their parsed Reply-To addresses through to JSON/CSV output and the Elasticsearch/OpenSearch nested `sample.reply_to` field.
+
+### Dashboard fixes
+
+All failure (RUF) dashboards now render every displayed address (`From`, `To`, `Reply-To`) the same way: `Display Name <addr>`, or the bare address when there is no display name. The format is assembled at query time from fields (`display_name` / `address`) that already exist on previously-indexed reports, so the panels work on historical data, not only on reports stored after upgrading — with one unavoidable exception: a report's `Reply-To` only appears for reports **parsed by 10.0.3 or later**. Earlier versions discarded it at parse time (the bug above), so it is absent from older stored reports; recovering it requires re-parsing the original samples.
+
+- **Splunk failure dashboard:** the email-samples panel showed empty `from` and `reply_to` columns — it renamed `parsed_sample.headers.from{}{}` / `parsed_sample.headers.reply-to{}{}`, which are mis-cased (the header keys are `From` / `Reply-To`) and array-of-array shaped. The panel now builds `from` and `reply_to` with an `eval` that coalesces `display_name <address>` down to the bare `address` when there is no display name. (A multi-address `Reply-To` falls back to addresses-only — a Splunk multi-value-rendering limitation, not a data-loss one.)
+- **OpenSearch failure dashboard:** the column labelled `reply_to` aggregated `sample.headers.in-reply-to.keyword` — the `In-Reply-To` threading header, not the Reply-To address. It now aggregates `sample.headers.reply-to.keyword`, and that field was added to the `dmarc_f*` index pattern. To support it, the Elasticsearch/OpenSearch failure writer now flattens the `Reply-To` header into a display string on `sample.headers["reply-to"]`, mirroring the existing `From` / `To` handling. (Re-import the dashboards, or refresh the `dmarc_f*` index pattern, to pick up the new field.)
+- **Grafana (Elasticsearch) dashboard:** the *Failure Samples* panel already read `sample.headers.reply-to.keyword`, but that field previously held the raw `[[name, address]]` array (split into separate name/address terms). The failure-writer flattening above makes the existing `ReplyTo` column render a clean `Name <address>` string — no dashboard change required.
+- **Grafana (PostgreSQL) dashboard:** the *Failure Reports* panel did not surface the message `From` header or `Reply-To` at all (it showed only the envelope `Mail From` / `Rcpt To`). Added `From` (from `sample_from`) and `Reply To` (aggregated from `dmarc_failure_sample_address`) columns.
+
+## 10.0.2
+
+### Changes
+
+- Bump the `mailsuite` requirement to `>=2.2.1`, which raises the transitive `mail-parser` floor to `>=4.2.1`. This pulls in two upstream fixes:
+  - `mail-parser` 4.2.1 stops returning a phantom `('', '')` entry for absent address headers, so parsedmarc no longer indexes an empty `Cc`/`Bcc` address (`{address: ""}`) for every DMARC failure-report sample in Elasticsearch/OpenSearch — and no longer emits it in JSON, S3, or Kafka output.
+  - `mail-parser` 4.2.1 also adopts the stricter address parsing that hardens against [CVE-2023-27043](https://nvd.nist.gov/vuln/detail/CVE-2023-27043) — a Python `email`-module flaw where an RFC 2822 header containing a special character has the wrong portion identified as the addr-spec, which can let a crafted address bypass email-domain verification.
+
+  (The `Reply-To` parsing for failure samples and the failure dashboards are tracked separately.)
+
+## 10.0.1
+
+### Changes
+
+- Bump `mailsuite` requirement to `>-2.2.0` to fix an upstream `Reply-To` header parsing bug for failure samples
+
+## 10.0.0
+
+### Enhancements
+
+#### Support for RFC 9989 / RFC 9990 / RFC 9991 reports
+
+Adds parsing support for the final DMARC specification (RFC 9989), the new aggregate-report schema (RFC 9990), and the new failure-report format (RFC 9991), while preserving full RFC 7489 / RFC 6591 backward compatibility.
+
+New aggregate-report fields surfaced from the RFC 9990 XSD — added to types, parsing, CSV output, and Elasticsearch/OpenSearch mappings:
+
+- `np` — non-existent subdomain policy (`none`/`quarantine`/`reject`)
+- `testing` — testing mode flag (`n`/`y`); reports whether the published DMARC record sets `t=y`. It is a **new field**, not a replacement for `pct`; the `pct` mechanism was removed entirely by RFC 9989 Appendix A.6 with no per-message replacement.
+- `discovery_method` — policy discovery method (`psl`/`treewalk`)
+- `generator` — report generator software identifier, in `report_metadata`
+- `human_result` — optional descriptive text on DKIM/SPF auth results (langAttrString; a possible `lang` attribute is automatically unwrapped)
+- `xml_namespace` — the XML namespace declared on the `<feedback>` root, if any. RFC 9990 reports declare `urn:ietf:params:xml:ns:dmarc-2.0`.
+
+`pct` is no longer present in RFC 9990's `PolicyPublishedType` and parses as `None` when absent. `fo` is still part of RFC 9990 and is preserved when set; it parses as `None` only when the reporter omits it.
+
+The parser detects an RFC 9990 report from the dmarc-2.0 XML namespace **or** the presence of any RFC 9990-only field, so namespaceless reports that follow the RFC 9990 shape still receive RFC 9990-aware validation warnings (missing required DKIM `selector`, removed-in-RFC-9990 policy-override types `forwarded` / `sampled_out`). RFC 9990 also added `policy_test_mode` to the policy-override enumeration; it is parsed and stored unchanged.
+
+For failure reports (RFC 9991), `Identity-Alignment` and `Auth-Failure` are split on CFWS-aware commas (whitespace is stripped from each token, per the RFC 9991 ABNF) and a warning is logged when either REQUIRED field is missing.
+
+Several elements that became `langAttrString` in RFC 9990 (`extra_contact_info`, `error`, `comment`, `human_result`) are now safely unwrapped when the reporter sends them with a `lang` attribute.
+
+Backwards compatibility to RFC 7489 is maintained.
+
+#### PostgreSQL storage backend
+
+New optional PostgreSQL output backend as a lighter-weight alternative to Elasticsearch/OpenSearch, configured via a `[postgresql]` section (host/port/user/password/database or a libpq `connection_string`), or equivalently through `PARSEDMARC_POSTGRESQL_*` environment variables and their `_FILE` Docker-secret variants like every other backend. Tables are created automatically on first run, and the schema captures the RFC 9990 aggregate fields (`np`, `testing`, `discovery_method`, `generator`, `xml_namespace`, and per-result `human_result`). A Grafana dashboard (`dashboards/grafana/Grafana-DMARC_Reports-PostgreSQL.json`) is included. Aggregate and SMTP-TLS reports are de-duplicated via `ON CONFLICT`; failure reports via an arrival-date / From / To / Subject check mirroring the Elasticsearch backend.
+
+The backend is opt-in: install it with `pip install parsedmarc[postgresql]` (it pulls in `psycopg`). It is not a mandatory dependency because the prebuilt `psycopg` binary wheels are not available for every platform.
+
+#### Docker-secret support via `_FILE` env vars
+
+Any `PARSEDMARC_{SECTION}_{KEY}` environment variable can now also be supplied via a file by appending `_FILE` to its name (e.g. `PARSEDMARC_IMAP_PASSWORD_FILE=/run/secrets/imap_password`). The file's contents (with trailing CR/LF stripped) are used as the value. This is the same convention used by the official Postgres, MariaDB, and Redis container images, so credentials no longer have to appear in plain `environment:` blocks where `docker inspect`, container logs, and `/proc/<pid>/environ` would expose them.
+
+When both the direct var and its `_FILE` companion are set, the file wins. A missing or unreadable file raises `ConfigurationError` rather than silently falling back to an empty value. The four pre-existing `*_file` config keys (`[general] log_file`, `[msgraph] token_file`, `[gmail_api] credentials_file`, `[gmail_api] token_file`) keep their direct-path semantics; wrap them in a Docker secret by doubling the suffix (`PARSEDMARC_GMAIL_API_CREDENTIALS_FILE_FILE`).
+
+#### Elastic Cloud Serverless compatibility
+
+New `[elasticsearch] serverless` config flag (env var `PARSEDMARC_ELASTICSEARCH_SERVERLESS`). Elastic Cloud Serverless manages sharding and replication itself and rejects the `number_of_shards` / `number_of_replicas` index settings with HTTP 400 — previously every write into a Serverless project failed at index-creation time. With the flag set, `create_indexes` strips those two keys from the settings sent to Elasticsearch and passes any other settings (e.g. `refresh_interval`) through unchanged. Non-Serverless deployments are unaffected.
+
+### Bug fixes
+
+- **`save_smtp_tls_report_to_s3` was completely broken.** `parsedmarc/s3.py:save_report_to_s3` unconditionally read `report["report_metadata"]` when assembling S3 object metadata, but SMTP TLS reports are flat per RFC 8460 §4.3 — they have no `report_metadata` sub-object — and `parse_smtp_tls_report_json` correctly stores `begin_date` as the raw ISO-8601 string from the report. The S3 path branch also assumed `begin_date` was a `datetime` and did `.year` / `.month` / `.day` on it. The CLI's surrounding `try/except` silently swallowed the resulting `KeyError`, so every SMTP-TLS report quietly failed to upload to S3 in production. Both issues are fixed: SMTP-TLS metadata is now built from the flat report fields directly, and the date is normalized via `human_timestamp_to_datetime`.
+- **`append_json` corrupted JSON output files on the second write.** The original implementation opened files in `"a+"` mode, then `seek()`ed backwards to overwrite the trailing `]` with `,\n` before appending more elements. [Python's docs are explicit](https://docs.python.org/3/library/functions.html#open): on POSIX, writes in `"a"`/`"a+"` mode always go to EOF regardless of seek position. The result was that every second call onto an existing file produced `[...]\n],\n[...]`-style corrupted output instead of a single merged JSON array. Anyone running parsedmarc in watch mode with JSON output enabled had `aggregate.json` / `failure.json` / `smtp_tls.json` quietly turning into invalid JSON after the first overlap. Replaced with a read-merge-write pattern: load the existing array (if any), append the new elements, rewrite the whole file. `append_csv` was not affected — it doesn't seek backwards.
+- **Removed redundant try/except in `parsedmarc/webhook.py`.** `save_aggregate_report_to_webhook` / `save_failure_report_to_webhook` / `save_smtp_tls_report_to_webhook` each wrapped `self._send_to_webhook(...)` in a try/except, but `_send_to_webhook` already catches every `Exception` itself, so the outer except blocks were unreachable dead code.
+- **Report files whose names contain glob metacharacters were silently skipped.** The CLI expanded every file argument with `glob()` ([`parsedmarc/cli.py`](parsedmarc/cli.py)), which interprets `[`, `]`, `*`, and `?` as pattern syntax (see the [`glob` docs](https://docs.python.org/3/library/glob.html)). A literal path such as `[Netease DMARC Failure Report] Rent Reminder.eml` — the bracketed shape many providers use for emailed failure reports — was treated as a character class, matched nothing, and was dropped before reaching the parser, with no error. File arguments that already exist on disk are now taken literally; only non-existent paths are treated as glob patterns, so shell-style wildcards (`samples/*.xml`) still expand.
+- **OpenSearch Dashboards reported a mapping conflict on the aggregate index pattern's `org_email` field.** The shipped `dashboards/opensearch/opensearch_dashboards.ndjson` froze a cached field-list snapshot in which `org_email` was a `text` / `object` conflict, alongside leftover `org_email.#text` and `org_email.#text.keyword` subfields — artifacts of a cluster that had once indexed a `langAttrString` `email` dict (`{"#text": …, "@lang": …}`) before the parser unwrapped it. `org_email` is mapped as `Text()` and the parser now unwraps a dict `email` to a plain string, so live data is consistent; cleared the stale conflict and the two artifact subfields from the index pattern, leaving `org_email` (text) and `org_email.keyword` so importers no longer see the warning.
+- **`dashboard-dev-bootstrap.sh` imported the OpenSearch Dashboards saved objects into the wrong tenant.** The script sent `securitytenant: global_tenant`, but the OpenSearch security plugin reads that header as a tenant *name*, and `global_tenant` is a sample custom tenant shipped in the security demo config — not the shared **Global** tenant, whose token is the literal `global`. The import succeeded into a separate `global_tenant` tenant (its own `.kibana_<hash>_globaltenant_1` index), so the dashboards were invisible to anyone viewing the Global tenant in OpenSearch Dashboards. Changed the default `OSD_TENANT` to `global`. (An empty/omitted `securitytenant` header is *not* equivalent — it falls back to the user's configured default tenant, not Global.) This affects the contributor dev stack only, not the shipped dashboards.
+
+### Breaking changes
+
+#### Forensic reports have been renamed to failure reports
+
+Forensic reports have been renamed to failure reports throughout the project to reflect the proper naming of the reports since RFC 7489.
+
+- **Core**: `types.py`, `__init__.py` — `ForensicReport`→`FailureReport`, `parse_forensic_report`→`parse_failure_report`, report type `"failure"`
+- **Output modules**: `elastic.py`, `opensearch.py`, `splunk.py`, `kafkaclient.py`, `syslog.py`, `gelf.py`, `webhook.py`, `loganalytics.py`, `s3.py`
+- **CLI**: `cli.py` — args, config keys, index names (`dmarc_failure`)
+- **Docs & dashboards**: all markdown, Grafana JSON, OpenSearch NDJSON, Splunk XML
+
+##### Backward compatibility
+
+- Old function/type names preserved as aliases: `parse_forensic_report = parse_failure_report`, `ForensicReport = FailureReport`, etc.
+- CLI config accepts both old (`save_forensic`, `forensic_topic`) and new keys (`save_failure`, `failure_topic`)
+- The archive subfolder for failure reports is now `Failure` (under `archive_folder`), renamed from `Forensic`. To avoid a split archive across `Forensic/` and `Failure/`, parsedmarc migrates an existing `Forensic` subfolder into `Failure` automatically on startup (best-effort): it renames the folder when no `Failure` folder exists yet, merges the two when both already exist, and logs-and-skips any mailbox it cannot reorganize (warn, don't crash). This consolidation uses the folder-management API (`folder_exists` / `rename_folder` / `merge_folders`) added in mailsuite 2.1.0, so the required `mailsuite` version is now `>=2.1.0`.
+- RFC 7489 reports parse with `None` for RFC 9990-only fields
+- **Updated dashboards with queries are backward compatible**: queries match data indexed under both old (`dmarc_forensic*` / `dmarc:forensic`) and new (`dmarc_failure*` / `dmarc:failure`) names, so dashboards show data from before and after the rename:
+  - **OpenSearch Dashboards**: Index pattern uses `dmarc_f*` to match both `dmarc_forensic*` and `dmarc_failure*`
+  - **Splunk**: Base search queries `(sourcetype="dmarc:failure" OR sourcetype="dmarc:forensic")`
+  - **Elasticsearch/OpenSearch**: Duplicate-check searches query across both `dmarc_failure*` and `dmarc_forensic*` index patterns
+
+## 9.11.2
+
+### Changes
+
+- **`base_reverse_dns_types.txt` removed; `sortlists.py` now reads the authoritative `type` list directly from `parsedmarc/resources/maps/README.md`.** The README's industry list (between new `<!-- types-list:start -->` / `<!-- types-list:end -->` HTML-comment markers) is now the single source of truth, eliminating the drift risk between the data file and the documented list. Before validating the map, `sortlists.py` also normalizes the README block in place: trims whitespace, deduplicates case-insensitively (errors on case-conflicting entries), and sorts entries alphabetically — so adding a new type is just inserting a `- New Type` line anywhere inside the markers. Also fixes a pre-existing typo in the precedence rules where rule 4 said `Web Hosting` but the canonical type used in 4,176 map rows is `Web Host`.
+- **Maintenance tooling no longer ships in the wheel/sdist.** The Python scripts under `parsedmarc/resources/maps/` (`collect_domain_info.py`, `classify_unknown_domains.py`, `detect_psl_overrides.py`, `detect_rebrands.py`, `sortlists.py`, plus the previously-already-excluded `find_bad_utf8.py` and `find_unknown_base_reverse_dns.py`) are maintainer-only batch tooling, not parsedmarc runtime code. They have always been in the repository for convenience but were unnecessarily included in distributions, pulling reviewer attention and contributing nothing to end-user functionality. The build now excludes any `.py` file under `parsedmarc/resources/maps/` whose name doesn't start with an underscore via a single glob pattern (`parsedmarc/resources/maps/[!_]*.py`), so future maintainer scripts added to that directory are excluded automatically while `__init__.py` continues to ship. The directory's `__init__.py` and the runtime data files (`base_reverse_dns_map.csv`, `known_unknown_base_reverse_dns.txt`, `psl_overrides.txt`) continue to ship — they're loaded at runtime via `importlib.resources.files(parsedmarc.resources.maps)`.
+
+## 9.11.1
+
+### Fixed
+
+- Bump required `mailsuite` version to `>=2.0.2` to address `RuntimeError: Event loop is closed` failures in the Microsoft Graph mailbox backend (#742).
+
+## 9.11.0
+
+### Changes
+
+- **Mailbox backends now live in `mailsuite>=2.0.0`.** The `IMAPConnection`, `MSGraphConnection`, `GmailConnection`, `MaildirConnection`, and `MailboxConnection` implementations were extracted into [mailsuite 2.0.0](https://github.com/seanthegeek/mailsuite/releases/tag/2.0.0) so other projects can reuse the same provider-agnostic interface. parsedmarc's `parsedmarc.mail` package is now a thin re-export of `mailsuite.mailbox`; existing imports (`from parsedmarc.mail import IMAPConnection`, etc.) continue to work unchanged. The CLI passes `token_cache_name="parsedmarc"` and forwards the existing `[msgraph] graph_url` config knob so cached `AuthenticationRecord`s and tokens carry over without re-prompting.
+- **MSGraph backend rewritten on `msgraph-sdk` (kiota-based).** mailsuite 2.0 replaces the retired `msgraph-core==0.2.2` REST wrapper with the supported `msgraph-sdk` client. End-user behavior is unchanged.
+- **Direct dependencies on `msgraph-core`, `imapclient`, `google-api-core`, `google-api-python-client`, `google-auth-httplib2`, `google-auth-oauthlib`, and `google-auth` removed.** They are now installed transitively via `mailsuite[gmail,msgraph]>=2.0.0`, which is included as a non-optional dependency so Gmail and Microsoft Graph support remain available out of the box.
+
+## 9.10.3
+
+### Fixed
+
+- **Bundled OSD aggregate dashboard reported source-row counts as message volume.** Pies, tables, and the choropleth aggregated with `count` instead of `sum(message_count)`, so panels titled "Message volume…", "Reporting organizations", etc. counted distinct sources rather than emails. Bug present since the dashboard shipped in 9.4.0. Line-chart timeseries, SMTP TLS, and forensic panels were already correct.
+- Splunk aggregate "Map of message sources by country" widget had the same `count`-instead-of-`sum(message_count)` bug.
+- Splunk forensic-samples table dropped events with null `From`/`To`/`Subject` because the base search required those fields to exist (`field=*`). Replaced with a null-tolerant filter pattern.
+- Splunk SMTP TLS Failure details panel returned no rows; Splunk doesn't evaluate `field>0` against multivalued JSON-array paths at search time. Switched to a presence filter plus post-stats `where failed_sessions>0`.
+
+### Changes
+
+- Aligned the Splunk dashboards with the OSD source-of-truth: new "Message sources by Autonomous System" panel; added missing `dkim_aligned` column to DKIM details; green/red colors for `true`/`false` on alignment pies and the DMARC-passage timechart; forensic dashboard simplified to OSD's two-panel layout (markdown + samples table); `policy_type` bucket added to SMTP TLS Domains; minor column / title alignments throughout.
+
+### Upgrade notes
+
+**Action required — re-import the dashboards.** Stored saved objects don't auto-update on parsedmarc upgrade.
+
+- **OSD:** *Stack Management → Saved Objects → Import* the new `dashboards/opensearch/opensearch_dashboards.ndjson`. **Switch the import mode from the default *"Create new objects with unique IDs"* to *"Check for existing objects"*** and enable *"Automatically overwrite conflicts"*. The default mode would import the corrected viz under fresh UUIDs and leave the buggy originals in place, so the dashboards would keep rendering the wrong numbers.
+- **Splunk:** paste each XML in `dashboards/splunk/` into the corresponding dashboard's Source editor.
+
+## 9.10.2
+
+### Fixed
+
+- `MaildirConnection.fetch_message()` now marks messages as read after reading them (sets the `S` flag and moves the file from `new/` to `cur/`), unless `--test` is in effect. Previously, a message was processed but its on-disk maildir state was unchanged, so an MUA scanning the same maildir kept showing it as unread. Mirrors the existing `mark_read=not test` pattern used for `MSGraphConnection`.
+- `get_ip_address_info()` no longer caches weak-fallback attributions (no PTR + no ASN-domain map match → raw `as_name` used as `source_name`, `source_type` left null). `get_reverse_dns()` swallows every `DNSException` as `None`, so a transient PTR lookup failure (timeout, SERVFAIL, socket error) is indistinguishable from a genuine no-PTR case at that layer — caching the weak result would poison the 4-hour cache with a misattribution that persisted even after the PTR became resolvable again. PTR-backed matches and ASN-domain matches (both stable attributions) are still cached as before; only the specific `reverse_dns=None AND type=None AND name=as_name` state skips the cache write so the next lookup retries.
+
+## 9.10.1
+
+### Fixed
+
+- Stripped speculative behavior from the IPinfo Lite REST API integration shipped in 9.10.0 after auditing the code against the [Lite API docs](https://ipinfo.io/developers/lite-api). The docs state the Lite API has "no daily or monthly limit and provides unlimited access" and document `?token=` query-parameter auth only; nothing else removed here is documented for Lite. Removed: the 429 rate-limit and 402 quota-exhausted handling, `Retry-After` parsing, cooldown state, and the associated warning/recovery logging; the `https://ipinfo.io/me` account-info probe that expected plan/limit/remaining fields (that endpoint isn't a Lite account endpoint); and the `Authorization: Bearer` header. Auth is now the documented `?token=` query param; the startup probe is a single `/lite/1.1.1.1` lookup that logs `IPinfo API configured` at info level. Retained behavior: 401/403 remains a fatal `InvalidIPinfoAPIKey`, and any other non-2xx or network error falls back to the bundled/cached MMDB per request.
+
+## 9.10.0
+
+### Changes
+
+- Renamed `[general] ip_db_url` to `ipinfo_url` to reflect what it actually overrides (the bundled IPinfo Lite MMDB download URL). The old name is still accepted as a deprecated alias and logs a warning on use; the env-var equivalent is now `PARSEDMARC_GENERAL_IPINFO_URL`, with `PARSEDMARC_GENERAL_IP_DB_URL` also still honored.
+- Added an optional IPinfo Lite REST API path for country + ASN lookups, so deployments that want the freshest data can query the API directly instead of waiting for the next MMDB release. Configure `[general] ipinfo_api_token` (or `PARSEDMARC_GENERAL_IPINFO_API_TOKEN`) and every IP lookup hits `https://api.ipinfo.io/lite/<ip>` first. At startup the `https://ipinfo.io/me` account endpoint is hit once to validate the token and log the plan, month-to-date usage, and remaining quota at info level (e.g. `IPinfo API configured — plan: Lite, usage: 12345/50000 this month, 37655 remaining`). An invalid token exits the process with a fatal error. Rate-limit (HTTP 429) and quota-exhausted (HTTP 402) responses put the API in a cooldown (honoring `Retry-After`, with a 5-minute / 1-hour default) and fall through to the bundled/cached MMDB; the first event is logged once at warning level and recovery is logged once at info level when the next lookup succeeds. Transient network errors fall through per-request without triggering a cooldown. The API token is never logged.
+- Renamed the ASN name and domain fields to match the IPinfo Lite MMDB's native schema: `asn_name` → `as_name` and `asn_domain` → `as_domain` on every source record (JSON output), and `source_asn_name` → `source_as_name` / `source_asn_domain` → `source_as_domain` in CSV output (aggregate + failure) and the Elasticsearch / OpenSearch / Splunk integrations. The integer `asn` / `source_asn` field is unchanged. The emitted order is `asn`, `as_name`, `as_domain`.
+
+### Upgrade notes
+
+- CSV / JSON / Elasticsearch / OpenSearch / Splunk consumers that query the 9.9.0 field names (`asn_name`, `asn_domain`, `source_asn_name`, `source_asn_domain`) must switch to `as_name`, `as_domain`, `source_as_name`, `source_as_domain`. Elasticsearch / OpenSearch will add the new mappings on next document write; existing documents indexed under the old names will stay in place until reindexed.
+
+## 9.9.0
+
+### Changes
+
+- Source attribution now has an ASN fallback. Every IP source record carries three new fields — `asn` (integer, e.g. `15169`), `asn_name` (`"Google LLC"`), and `asn_domain` (`"google.com"`) — sourced from the bundled IPinfo Lite MMDB. When an IP has no reverse DNS, `get_ip_address_info()` uses `asn_domain` as a lookup into the same `reverse_dns_map`, and if that misses, falls back to the raw `asn_name`. `reverse_dns` and `base_domain` stay null on ASN-derived rows so consumers can still distinguish PTR-derived from ASN-derived attribution.
+- Added `source_asn`, `source_asn_name`, `source_asn_domain` to CSV output (aggregate + forensic), JSON output, and the Elasticsearch / OpenSearch / Splunk integrations. `source_asn` is mapped as `Integer` at the schema level so consumers can do range queries and numeric sorts; dashboards can prepend `"AS"` at display time.
+- Expanded `base_reverse_dns_map.csv` with 500 ASN-domain aliases for the most-routed IPv4 ranges. IPv4-weighted coverage of the bundled `ipinfo_lite.mmdb` went from ~34% of routed space matching a map entry via ASN domain to ~85%. Every alias is a brand that was already in the map under a different rDNS-base key (e.g. adding `comcast.com` alongside the existing `comcast.net`), plus a small number of large operators that previously had no entry. 11 entries were also promoted out of `known_unknown_base_reverse_dns.txt` because ASN context made their identity unambiguous.
+- Added `get_ip_address_db_record()` in `parsedmarc.utils`, a single-open MMDB reader that returns country + ASN fields together. `get_ip_address_country()` is now a thin wrapper. Supports both IPinfo Lite's schema (`country_code`, `asn` as `"AS15169"`, `as_name`, `as_domain`) and MaxMind's (`country.iso_code`, `autonomous_system_number` as int, `autonomous_system_organization`) in one pass; ASN is normalized to a plain int from either. MaxMind users who drop in their own ASN MMDB get `asn` + `asn_name` populated; `asn_domain` stays null because MaxMind doesn't carry it.
+
+### Fixed
+
+- `get_ip_address_info()` now caches entries for IPs without reverse DNS. Previously the cache write was inside the `if reverse_dns is not None` branch, so every no-PTR IP re-did the MMDB read and DNS attempt on every call.
+- Fixed three bugs in `parsedmarc/resources/maps/sortlists.py` that silently disabled the `type`-column validator and sorted the map case-sensitively, contrary to its documented behavior:
+  - Validator allowed-values map was keyed on `"Type"` (capital T), but the CSV header is `"type"` (lowercase), so every row bypassed validation.
+  - Types were read with trailing newlines via `f.readlines()`, so comparisons would not have matched even if the column name had been right.
+  - `sort_csv()` was called without `case_insensitive_sort=True`, which moved the sole mixed-case key (`United-domains.de`) to the top of the file instead of into its alphabetical position.
+- Fixed eight pre-existing map rows with invalid or inconsistent `type` values that the now-working validator surfaced: casing corrections for `dhl.com` (`logistics` → `Logistics`), `ghm-grenoble.fr` (`healthcare` → `Healthcare`), and `regusnet.com` (`Real estate` → `Real Estate`); reclassified `lodestonegroup.com` from the nonexistent `Insurance` type to `Finance`; added missing `Religion` and `Utilities` entries to `base_reverse_dns_types.txt` so it matches the README's industry list.
+- Fixed the `rt.ru` map entry: was classified as `RT,Government Media`, which conflated Rostelecom (the Russian telco that owns and uses `rt.ru`) with RT / Russia Today (which uses `rt.com`). Corrected to `Rostelecom,ISP`.
+
+### Upgrade notes
+
+- Output schema change: CSV, JSON, Elasticsearch, OpenSearch, and Splunk all gain three new fields per row (`source_asn`, `source_asn_name`, `source_asn_domain`). Existing queries and dashboards keep working; dashboards that want to consume the new fields will need to be updated. Elasticsearch / OpenSearch will add the new mappings on next document write.
+- Rows for IPs without reverse DNS now populate `source_name` / `source_type` via ASN fallback. If downstream dashboards treated "null `source_name`" as a signal for "no rDNS", switch to checking `source_reverse_dns IS NULL` instead — that remains the unambiguous signal.
+
+## 9.8.0
+
+### Changes
+
+- Replaced the bundled DB-IP Country Lite database with the [IPinfo Lite] database (`parsedmarc/resources/ipinfo/ipinfo_lite.mmdb`, under the [Creative Commons Attribution-ShareAlike 4.0 License][cc-by-sa-4]) for greater IP-to-country lookup accuracy. The download URL / cached filename / packaged module path have all moved from `dbip/dbip-country-lite.mmdb` to `ipinfo/ipinfo_lite.mmdb`.
+- `get_ip_address_country()` now reads MMDBs with `maxminddb` directly and handles both schemas — the IPinfo flat-top-level `country_code` field and the MaxMind/DBIP nested `country.iso_code` field — so users who drop in their own MMDB from any of these providers continue to work. The in-disk search list for user-supplied files still includes `ipinfo_lite.mmdb`, `GeoLite2-Country.mmdb`, and `dbip-country-lite*.mmdb`.
+- Dropped the `geoip2` dependency (its only use was the `.country()` helper, which is incompatible with the IPinfo schema). Added `maxminddb` as a direct dependency — it was already installed transitively through `geoip2`, so this is a no-op for most environments.
+
+### Upgrade notes
+
+- Callers that imported `parsedmarc.resources.dbip` directly need to switch to `parsedmarc.resources.ipinfo`. The `parsedmarc.resources.dbip` module has been removed.
+- Callers that imported `geoip2` only because `parsedmarc` depended on it will need to add it to their own requirements. `parsedmarc` itself no longer depends on `geoip2`.
+- The auto-update download URL used by previous parsedmarc versions (`.../dbip/dbip-country-lite.mmdb`) is no longer hosted on `master`; those versions will fail to download and fall back to their bundled copy, which is the documented behavior of `load_ip_db()`.
+
+[IPinfo Lite]: https://ipinfo.io/lite
+[cc-by-sa-4]: https://creativecommons.org/licenses/by-sa/4.0/deed.en
+
+## 9.7.1
+
+### Changes
+
+- Ported DNS lookup reliability improvements from checkdmarc 5.15.x:
+  - Per-query UDP timeout is now capped at `min(1.0, timeout)` in `query_dns()`, so a single dropped UDP datagram no longer consumes the entire lifetime budget — dnspython retries UDP within the lifetime window (mirroring `dig`'s default `+tries=3`). With multiple nameservers configured, the same cap also makes a slow or broken nameserver fall through to the next quickly.
+  - With multiple nameservers configured, the resolver lifetime is now `timeout × len(nameservers)` so each nameserver gets its own timeout budget for failover rather than sharing one overall deadline.
+  - New `retries` kwarg on `query_dns()`, `get_reverse_dns()`, and `get_ip_address_info()` retries the whole query on transient errors (`LifetimeTimeout`, `NoNameservers`/SERVFAIL, and `OSError` during TCP fallback). `NXDOMAIN` and `NoAnswer` remain non-retryable. Default is 0 (no behavior change for existing callers).
+  - Threaded `dns_retries` through the parser API (`parse_report_file`, `parse_aggregate_report_xml`, `parse_forensic_report`, `parse_report_email`, `get_dmarc_reports_from_mbox`, `get_dmarc_reports_from_mailbox`, `watch_inbox`).
+- Added `--dns-retries N` CLI flag and `dns_retries` INI option (`[general]` section, also surfaced via `PARSEDMARC_GENERAL_DNS_RETRIES` env var).
+- Centralized DNS defaults in `parsedmarc.constants`: `DEFAULT_DNS_TIMEOUT`, `DEFAULT_DNS_MAX_RETRIES`, and `RECOMMENDED_DNS_NAMESERVERS` (a cross-provider mix — `("1.1.1.1", "8.8.8.8")` — for callers that want public-resolver failover). The existing default nameservers (all-Cloudflare) are preserved for backward compatibility; callers opt in by passing `nameservers=RECOMMENDED_DNS_NAMESERVERS`.
+
+## 9.7.0
+
+### Changes
+
+- `psl_overrides.txt` is now automatically downloaded at startup (and on SIGHUP in watch mode) by `load_psl_overrides()` in `parsedmarc.utils`, with the same URL / local-file / offline fallback pattern as the reverse DNS map. It is also reloaded whenever `load_reverse_dns_map()` runs, so `base_reverse_dns_map.csv` entries that depend on a recent overrides entry resolve correctly without requiring a new parsedmarc release.
+- Added the `local_psl_overrides_path` and `psl_overrides_url` configuration options (`[general]` section, also surfaced via `PARSEDMARC_GENERAL_*` env vars) to override the default PSL overrides source.
+- Expanded `base_reverse_dns_map.csv` substantially in this release, following a multi-pass classification pass across the unknown/known-unknown lists (net ~+1,000 entries).
+- Added `Religion` and `Utilities` to the allowed `type` values in `base_reverse_dns_types.txt` and documented them in `parsedmarc/resources/maps/README.md`.
+- Added `parsedmarc/resources/maps/collect_domain_info.py` — a bulk enrichment collector that runs WHOIS, a size-capped HTTP GET, and A/AAAA + IP-WHOIS for every unmapped reverse-DNS base domain, writing a compact TSV suitable for a single classification pass. Respects `psl_overrides.txt` and skips full-IP entries.
+- Added `parsedmarc/resources/maps/detect_psl_overrides.py` — scans `unknown_base_reverse_dns.csv` for IP-containing entries that share a brand suffix, auto-appends the suffix to `psl_overrides.txt`, folds affected entries in all three list files, and removes any remaining full-IP entries for privacy.
+- `find_unknown_base_reverse_dns.py` now drops full-IP entries at ingest so customer IPs never enter the pipeline.
+- Documented the full map-maintenance workflow (privacy rule, auto-override detection, conservative classification, known-unknown handling) in the top-level `AGENTS.md`.
+
+### Fixed
+
+- Reverse-DNS base domains containing a full IPv4 address (four dotted or dashed octets) are now blocked from entering `base_reverse_dns_map.csv`, `known_unknown_base_reverse_dns.txt`, and `unknown_base_reverse_dns.csv`. Customer IPs were previously possible in these lists as part of ISP-generated reverse-DNS subdomain patterns. The filter is enforced in `find_unknown_base_reverse_dns.py`, `collect_domain_info.py`, and `detect_psl_overrides.py`. The existing lists were swept and all pre-existing IP-containing entries removed.
+
+## 9.6.0
+
+### Changes
+
+- The included DB-IP Country Lite database is now automatically updated at startup (and on SIGHUP in watch mode) by downloading the latest copy from GitHub, unless the `offline` flag is set. Falls back to a previously cached copy or the bundled database on failure. This allows the IP-to-country database to stay current without requiring a new package release.
+- Updated the included DB-IP Country Lite database to the 2026-04 release.
+- Added the `ip_db_url` configuration option (`PARSEDMARC_GENERAL_IP_DB_URL` env var) to override the default download URL for the IP-to-country database.
+
+## 9.5.5
+
+### Fixed
+
+- Output client initialization now retries up to 4 times with exponential backoff before exiting. This fixes persistent `Connection refused` errors in Docker when OpenSearch or Elasticsearch is momentarily unavailable at startup.
+- Use tuple format for `http_auth` in OpenSearch and Elasticsearch connections, matching the documented convention and avoiding potential issues if the password contains a colon.
+- Fix current_time format for MSGraphConnection (current-time) (PR #708)
+
+### Changes
+
+- Added debug logging to all output client initialization (S3, syslog, Splunk HEC, Kafka, GELF, webhook, Elasticsearch, OpenSearch).
+- `DEBUG=true` and `PARSEDMARC_DEBUG=true` are now accepted as short aliases for `PARSEDMARC_GENERAL_DEBUG=true`.
+
+## 9.5.4
+
+### Fixed
+
+- Maildir `fetch_messages` now respects the `reports_folder` argument. Previously it always read from the top-level Maildir, ignoring the configured reports folder. `fetch_message`, `delete_message`, and `move_message` now also operate on the correct active folder.
+- Config key aliases for env var compatibility: `[maildir] create` and `path` are now accepted as aliases for `maildir_create` and `maildir_path`, and `[msgraph] url` for `graph_url`. This allows natural env var names like `PARSEDMARC_MAILDIR_CREATE` to work without the redundant `PARSEDMARC_MAILDIR_MAILDIR_CREATE`.
+
+## 9.5.3
+
+### Fixed
+
+- Fixed `FileNotFoundError` when using Maildir with Docker volume mounts. Python's `mailbox.Maildir(create=True)` only creates `cur/new/tmp` subdirectories when the top-level directory doesn't exist; Docker volume mounts pre-create the directory as empty, skipping subdirectory creation. parsedmarc now explicitly creates the subdirectories when `maildir_create` is enabled.
+- Maildir UID mismatch no longer crashes the process. In Docker containers where volume ownership differs from the container UID, parsedmarc now logs a warning instead of raising an exception. Also handles `os.setuid` failures gracefully in containers without `CAP_SETUID`.
+- Token file writes (MS Graph and Gmail) now create parent directories automatically, preventing `FileNotFoundError` when the token path points to a directory that doesn't yet exist.
+- File paths from config (`token_file`, `credentials_file`, `cert_path`, `log_file`, `output`, `ip_db_path`, `maildir_path`, syslog cert paths, etc.) now expand `~` and `$VAR` references via `os.path.expanduser`/`os.path.expandvars`.
+
+## 9.5.2
+
+### Fixed
+
+- Fixed `ValueError: invalid interpolation syntax` when config values (from env vars or INI files) contain `%` characters, such as in passwords. Disabled ConfigParser's `%`-based string interpolation.
+
+## 9.5.1
+
+### Changes
+
+- Correct ISO format for MSGraphConnection timestamps (PR #706)
+
+## 9.5.0
+
+### Added
+
+- Environment variable configuration support: any config option can now be set via `PARSEDMARC_{SECTION}_{KEY}` environment variables (e.g. `PARSEDMARC_IMAP_PASSWORD`, `PARSEDMARC_SPLUNK_HEC_TOKEN`). Environment variables override config file values but are overridden by CLI arguments.
+- `PARSEDMARC_CONFIG_FILE` environment variable to specify the config file path without the `-c` flag.
+- Env-only mode: parsedmarc can now run without a config file when `PARSEDMARC_*` environment variables are set, enabling fully file-less Docker deployments.
+- Explicit read permission check on config file, giving a clear error message when the container UID cannot read the file (e.g. `chmod 600` with a UID mismatch).
+
+## 9.4.0
+
+### Added
+
+- Extracted `load_reverse_dns_map()` utility function in `utils.py` for loading the reverse DNS map independently of individual IP lookups.
+- SIGHUP reload now re-downloads/reloads the reverse DNS map, so changes take effect without restarting.
+- Add premade OpenSearch index patterns, visualizations, and dashboards
+
+### Changed
+
+- When `index_prefix_domain_map` is configured, SMTP TLS reports for domains not in the map are now silently dropped instead of being output. Unlike DMARC, TLS-RPT has no DNS authorization records, so this filtering prevents processing reports for unrelated domains.
+- Bump OpenSearch support to `< 4`
+
+### Fixed
+
+- Fixed `get_index_prefix` using wrong key (`domain` instead of `policy_domain`) for SMTP TLS reports, which prevented domain map matching from working for TLS reports.
+- Domain matching in `get_index_prefix` now lowercases the domain for case-insensitive comparison.
+
+## 9.3.1
+
+### Breaking changes
+
+- Elasticsearch and OpenSearch now verify SSL certificates by default when `ssl = True`, even without a `cert_path`
+- Added `skip_certificate_verification` option to the `elasticsearch` and `opensearch` configuration sections for consistency with `splunk_hec`
+
+### Fixed
+
+- Splunk HEC `skip_certificate_verification` now works correctly
+- SMTP TLS reports no longer fail when saving to multiple output targets (e.g. Elasticsearch and OpenSearch) due to in-place mutation of the report dict
+- Output client initialization errors now identify which module failed (e.g. "OpenSearch: ConnectionError..." instead of generic "Output client error")
+
+## 9.3.0
+
+### Added
+
+- SIGHUP-based configuration reload for watch mode — update output destinations, DNS/GeoIP settings, processing flags, and log level without restarting the service or interrupting in-progress report processing.
+  - Use `systemctl reload parsedmarc` when running under `systemd`.
+  - On a successful reload, old output clients are closed and recreated.
+  - On a failed reload, the previous configuration remains fully active.
+- `close()` methods on `GelfClient`, `KafkaClient`, `SyslogClient`, `WebhookClient`, HECClient, and `S3Client` for clean resource teardown on reload.
+- `config_reloading` parameter on all `MailboxConnection.watch()` implementations and `watch_inbox()` to ensure SIGHUP never triggers a new email batch mid-reload.
+- Elasticsearch and OpenSearch connections are now tracked and cleaned up on reload via `_close_output_clients()`.
+- Extracted `_parse_config_file()` and `_init_output_clients()` from `_main()` in `cli.py` to support config reload and reduce code duplication.
+
+### Fixed
+
+- `get_index_prefix()` crashed on failure reports with `TypeError` due to `report()` instead of `report[]` dict access.
+- Missing `exit(1)` after IMAP user/password validation failure allowed execution to continue with `None` credentials.
+
+## 9.2.1
+
+### Added
+
+- Better checking of `msgraph` configuration (PR #695)
+
+### Changed
+
+- Updated `dbip-country-lite` database to version `2026-03`
+- DNS query error logging level from `warning` to `debug`
+
+## 9.2.0
+
+### Added
+
+- OpenSearch AWS SigV4 authentication support (PR #673)
+- IMAP move/delete compatibility fallbacks (PR #671)
+- `fail_on_output_error` CLI option for sink failures (PR #672)
+- Gmail service account auth mode for non-interactive runs (PR #676)
+- Microsoft Graph certificate authentication support (PRs #692 and #693)
+- Microsoft Graph well-known folder fallback for root listing failures (PR #618 and #684 close #609)
+
+### Fixed
+
+- Pass mailbox since filter through `watch_inbox` callback (PR #670 closes issue #581)
+- `parsedmarc.mail.gmail.GmailConnection.delete_message` now properly calls the Gmail API (PR #668)
+- Avoid extra mailbox fetch in batch and test mode (PR #691 closes #533)
+
+## 9.1.2
+
+### Fixes
+
+- Fix duplicate detection for normalized aggregate reports in Elasticsearch/OpenSearch (PR #666 fixes issue #665)
+
+## 9.1.1
+
+### Fixes
+
+- Fix the use of Elasticsearch and OpenSearch API keys (PR #660 fixes issue #653)
+
+### Changes
+
+- Drop support for Python 3.9 (PR #661)
+
+## 9.1.0
+
+## Enhancements
+
+- Add TCP and TLS support for syslog output. (#656)
+- Skip DNS lookups in GitHub Actions to prevent DNS timeouts during tests timeouts. (#657)
+- Remove microseconds from DMARC aggregate report time ranges before parsing them.
+
+## 9.0.10
+
+- Support Python 3.14+
+
+## 9.0.9
+
+### Fixes
+
+- Validate that a string is base64-encoded before trying to base64 decode it. (PRs #648 and #649)
+
+## 9.0.8
+
+### Fixes
+
+- Fix logging configuration not propagating to child parser processes (#646).
+- Update `mailsuite` dependency to `?=1.11.1` to solve issues with iCloud IMAP (#493).
+
+## 9.0.7
+
+## Fixes
+
+- Fix IMAP `since` option (#PR 645 closes issues #581 and #643).
+
+## 9.0.6
+
+### Fixes
+
+- Fix #638.
+- Fix/clarify report extraction and parsing behavior for multiple input types (bytes, base64 strings, and file-like objects).
+- Fix type mismatches that could cause runtime issues in SMTP emailing and CLI option handling.
+
+### Improvements
+
+- Improve type hints across the library (Pylance/Pyright friendliness) and reduce false-positive linter errors.
+- Emails in Microsoft 365 are now marked read as they are read. This provides constancy with other mailbox types, and gives you a indication of when emails are being read as they are processed in batches. (Close #625)
+
+### Compatibility / Dependencies
+
+- Set Python requirement to `>=3.9,<3.14`.
+- Bump `mailsuite` requirement to `>=1.11.0`.
+
+## 9.0.5
+
+## Fixes
+
+- Fix report type detection introduced in `9.0.4`.
+
+## 9.0.4 (Yanked)
+
+### Fixes
+
+- Fix saving reports to OpenSearch ([#637](https://github.com/domainaware/parsedmarc/issues/637))
+- Fix parsing certain DMARC failure/forensic reports
+- Some fixes to type hints (incomplete, but published as-is due to the above bugs)
+
+## 9.0.3
+
+### Fixes
+
+- Set `requires-python` to `>=3.9, <3.14` to avoid [this bug](https://github.com/python/cpython/issues/142307)
+
+## 9.0.2
+
+## Improvements
+
+- Type hinting is now used properly across the entire library. (#445)
+
+## Fixes
+
+- Decompress report files as needed when passed via the CLI.
+- Fixed incomplete removal of the ability for `parsedmarc.utils.extract_report` to accept a file path directly in `8.15.0`.
+
+## Breaking changes
+
+This version of the library requires consumers to pass certain arguments as keyword-only. Internally, the API uses a bare `*` in the function signature. This is standard per [PEP 3102](https://peps.python.org/pep-3102/)  and as documented in the Python Language Reference.
+
+## 9.0.1
+
+### Fixes
+
+- Allow multiple `records` for the same aggregate DMARC report in Elasticsearch and Opensearch
+
+## 9.0.0 (yanked)
+
+- Normalize aggregate DMARC report volumes when a report timespan exceeds 24 hours
+
+## 8.19.1
+
+- Ignore HTML content type in report email parsing (#626)
+
+## 8.19.0
+
+- Add multi-tenant support via an index-prefix domain mapping file
+- PSL overrides so that services like AWS are correctly identified
+- Additional improvements to report type detection
+- Fix webhook timeout parsing (PR #623)
+- Output to STDOUT when the new general config boolean `silent` is set to `False` (Close #614)
+- Additional services added to `base_reverse_dns_map.csv`
+
+## 8.18.9
+
+- Complete fix for #687 and more robust report type detection
+
+## 8.18.8
+
+- Fix parsing emails with an uncompressed aggregate report attachment (Closes #607)
+- Add `--no-prettify-json` CLI option (PR #617)
+
+## 8.18.7
 
 Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 
-8.18.6
-------
+## 8.18.6
 
 - Fix since option to correctly work with weeks (PR #604)
 - Add 183 entries to `base_reverse_dns_map.csv`
@@ -15,25 +675,21 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Check for invalid UTF-8 bytes in `base_reverse_dns_map.csv` at build
 - Exclude unneeded items from the `parsedmarc.resources` module at build
 
-8.18.5
-------
+## 8.18.5
 
 - Fix CSV download
 
-8.18.4
-------
+## 8.18.4
 
 - Fix webhooks
 
-8.18.3
-------
+## 8.18.3
 
 - Move `__version__` to `parsedmarc.constants`
 - Create a constant `USER_AGENT`
 - Use the HTTP `User-Agent` header value `parsedmarc/version` for all HTTP requests
 
-8.18.2
-------
+## 8.18.2
 
 - Merged PR #603
   - Fixes issue #595 - CI test fails for Elasticsearch
@@ -45,55 +701,46 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Automatically fall back to the internal `base_reverse_dns_map.csv` if the received file is not valid (Fixes #602)
   - Print the received data to the debug log
 
-8.18.1
-------
+## 8.18.1
 
 - Add missing `https://` to the default Microsoft Graph URL
 
-8.18.0
-------
+## 8.18.0
 
 - Add support for Microsoft national clouds via Graph API base URL (PR #590)
 - Avoid stopping processing when an invalid DMARC report is encountered (PR #587)
 - Increase `http.client._MAXHEADERS` from `100` to `200` to avoid errors connecting to Elasticsearch/OpenSearch (PR #589)
 
-8.17.0
-------
+## 8.17.0
 
 - Ignore duplicate aggregate DMARC reports with the same `org_name` and `report_id` seen within the same hour (Fixes #535)
 - Fix saving SMTP TLS reports to OpenSearch (PR #585 closed issue #576)
 - Add 303 entries to `base_reverse_dns_map.csv`
 
-8.16.1
-------
+## 8.16.1
 
 - Failed attempt to ignore aggregate DMARC reports seen within a period of one hour (#535)
 
-8.16.0
-------
+## 8.16.0
 
 - Add a `since` option to only search for emails since a certain time (PR #527)
 
-8.15.4
-------
+## 8.15.4
 
 - Fix crash if aggregate report timespan is > 24 hours
 
-8.15.3
-------
+## 8.15.3
 
 - Ignore aggregate reports with a timespan of > 24 hours (Fixes #282)
 
-8.15.2
-------
+## 8.15.2
 
 - Require `mailsuite>=1.9.18`
   - Pins `mail-parser` version at `3.15.0` due to a parsing regression in mail-parser `4.0.0`
   - Parse aggregate reports with empty `<auth_results>`
   - Do not overwrite the log on each run (PR #569 fixes issue #565)
 
-8.15.1
-------
+## 8.15.1
 
 - Proper IMAP namespace fix (Closes issue #557 and issue #563)
   - Require `mailsuite>=1.9.17`
@@ -101,44 +748,38 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Add pre-flight check for nameservers (PR #562 closes issue #543)
 - Reformat code with `ruff`
 
-8.15.0
-------
+## 8.15.0
 
-- Fix processing of SMTP-TLS reports ([#549](https://github.com/domainaware/parsedmarc/issues/549)), which broke in commit [410663d ](https://github.com/domainaware/parsedmarc/commit/410663dbcaba019ca3d3744946348b56a635480b)(PR [#530](https://github.com/domainaware/parsedmarc/pull/530))
+- Fix processing of SMTP-TLS reports ([#549](https://github.com/domainaware/parsedmarc/issues/549)), which broke in commit [410663d](https://github.com/domainaware/parsedmarc/commit/410663dbcaba019ca3d3744946348b56a635480b)(PR [#530](https://github.com/domainaware/parsedmarc/pull/530))
   - This PR enforced a stricter check for base64-encoded strings, which SMTP TLS reports from Google did not pass
   - Removing the check introduced its own issue, because some file paths were treated as base64-encoded strings
 - Create a separate `extract_report_from_file_path()` function for processioning reports based on a file path
 - Remove report extraction based on a file path from `extract_report()`
 
-8.14.2
-------
+## 8.14.2
 
 - Update `base_reverse_dns_map.csv` to fix over-replacement on [`f3a5f10`](https://github.com/domainaware/parsedmarc/commit/f3a5f10d67b02c5db31ae1f7ced68028f46ca2a3) (PR #553)
 
-8.14.1
-------
+## 8.14.1
 
 - Failed attempt to fix processing of SMTP-TLS reports (#549)
 
-8.14.0
-------
+## 8.14.0
 
 - Skip invalid aggregate report rows without calling the whole report invalid
   - Some providers such as GoDaddy will send reports with some rows missing a source IP address, while other rows are fine
-- Fix Dovecot support by using the seperator provided by the IPMAP namespace when possible (PR #552 closes #551)
+- Fix Dovecot support by using the separator provided by the IMAP namespace when possible (PR #552 closes #551)
 - Only download `base_reverse_dns_map.csv` once (fixes #542)
 - Update included `base_reverse_dns_map.csv`
   - Replace University category with Education to be more inclusive
 - Update included `dbip-country-lite.mmdb`
 
-8.13.0
-------
+## 8.13.0
 
 - Add Elastic/OpenSearch index prefix option (PR #531 closes #159)
 - Add GELF output support (PR #532)
 
-8.12.0
-------
+## 8.12.0
 
 - Fix for deadlock with large report (#508)
 - Build: move to kafka-python-ng (#510)
@@ -147,8 +788,7 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Fix if base_domain is None before get_service_from_reverse_dns_base_domain (#514)
 - Update base_reverse_dns_map.csv
 
-8.11.0
-------
+## 8.11.0
 
 - Actually save `source_type` and `source_name` to Elasticsearch and OpenSearch
 - Reverse-lookup cache improvements (PR #501 closes issue #498)
@@ -159,50 +799,41 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
   - `local_reverse_dns_map_path` - Overrides the default local file path to use for the reverse DNS map
   - `reverse_dns_map_url` - Overrides the default download URL for the reverse DNS map
 
-8.10.3
-------
+## 8.10.3
 
 - Fix flaws in `base_reverse_dns_map.csv`
 
-8.10.2
-------
+## 8.10.2
 
 - Fix flaws in `base_reverse_dns_map.csv`
 
-8.10.1
-------
+## 8.10.1
 
 - Fix flaws in `base_reverse_dns_map.csv`
 
-8.10.0
-------
+## 8.10.0
 
 - Fix MSGraph UsernamePassword Authentication (PR #497)
 - Attempt to download an updated `base_reverse_dns_map.csv` at runtime
 - Update included `base_reverse_dns_map.csv`
 
-8.9.4
------
+## 8.9.4
 
 - Update `base_reverse_dns_map.csv`
 
-8.9.3
------
+## 8.9.3
 
 - Revert change in 8.9.2
 
-8.9.2
------
+## 8.9.2
 
 - Use `Uncategorized` instead of `None` as the service type when a service cannot be identified
 
-8.9.1
------
+## 8.9.1
 
 - Fix broken CLI by removing obsolete parameter from `cli_parse` call (PR #496 closes issue #495)
 
-8.9.0
------
+## 8.9.0
 
 - Fix broken cache (PR #494)
 - Add source name and type information based on static mapping of the reverse DNS base domain
@@ -210,14 +841,12 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Replace `multiprocessing.Pool` with `Pipe` + `Process` (PR #491 closes issue #489)
 - Remove unused parallel arguments (PR #492 closes issue #490)
 
-8.8.0
------
+## 8.8.0
 
 - Add support for OpenSearch (PR #481 closes #480)
 - Fix SMTP TLS reporting to Elasticsearch (PR #470)
 
-8.7.0
------
+## 8.7.0
 
 - Add support for SMTP TLS reports (PR #453 closes issue #71)
 - Do not replace content in forensic samples (fix #403)
@@ -231,99 +860,83 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Add Gmail pagination (PR #469)
 - Use the correct `msgraph` scope (PR #471)
 
-8.6.4
------
+## 8.6.4
 
 - Properly process aggregate reports that incorrectly call `identifiers` `identities`
 - Ignore SPF results in aggregate report records if the domain is not provided
 
-8.6.3
------
+## 8.6.3
 
 - Add an error message instead of raising an exception when an aggregate report time span is greater than 24 hours
 
-8.6.2
------
+## 8.6.2
 
 - Use `zlib` instead of `Gzip` to decompress more `.gz` files, including the ones supplied by Mimecast (Based on #430 closes #429)
 
-8.6.1
------
+## 8.6.1
 
 - Fix handling of non-domain organization names (PR #411 fixes issue #410)
 - Skip processing of aggregate reports with a date range that is too long to be valid (PR #408 fixes issue #282)
-- Better error handeling for Elasticsearch queries and file parsing (PR #417)
+- Better error handling for Elasticsearch queries and file parsing (PR #417)
 
-8.6.0
------
+## 8.6.0
 
 - Replace publicsuffix2 with publicsuffixlist
 
-8.5.0
------
+## 8.5.0
 
 - Add support for Azure Log Analytics (PR #394)
 - Fix a bug in the Microsoft Graph integration that caused a crash when an inbox has 10+ folders (PR #398)
 - Documentation fixes
 
-8.4.2
------
+## 8.4.2
 
 - Only initialize the syslog, S3 and Kafka clients once (PR #386 closes issues #289 and #380)
 
-8.4.1
------
+## 8.4.1
 
 - Fix bug introduced in 8.3.1 that caused `No such file or directory` errors if output files didn't exist (PR #385 closes issues #358 and #382)
 - Make the `--silent` CLI option only print errors. Add the `--warnings` options to also print warnings (PR #383)
 
-8.4.0
------
+## 8.4.0
 
 - Provide a warning when no file is located at the path specified by the `ip_db_path` option (based on PR #369 with improvements in grammar)
 - Add `allow_unencrypted_storage` to possible `msgraph` settings. See documentation for details. (PR #375)
 - Use the `check_timeout` value in the event of an IMAP connection error, instead of a static 5 second value (PR #377)
 - Update the included DBIP IP to Country Lite database to the December 2022 release
 
-8.3.2
------
+## 8.3.2
 
 - Improvements to the Microsoft Graph integration (PR #352)
 
-8.3.1
------
+## 8.3.1
 
 - Handle unexpected XML parsing errors more gracefully (PR #349)
 - Migrate build from `setuptools` to `hatch`
 
-8.3.0
------
+## 8.3.0
 
 - Support MFA for Microsoft Graph (PR #320 closes issue #319)
 - Add more options for S3 export (PR #328)
 - Provide a helpful error message when the log file cannot be created (closes issue #317)
 
-8.2.0
------
+## 8.2.0
 
 - Support non-standard, text-based forensic reports sent by some mail hosts
 - Set forensic report version to `None` (`null` in JSON) if the report was in a non-standard format and/or is missing a version number
 - The default value of the `mailbox` `batch_size` option is now `10` (use `0` for no limit)
 
-8.1.1
------
+## 8.1.1
 
 - Fix marking messages as read via Microsoft Graph
 
-8.1.0
------
+## 8.1.0
 
 - Restore compatibility with <8.0.0 configuration files (with deprecation warnings)
 - Set default `reports_folder` to `Inbox` (rather than `INBOX`) when `msgraph` is configured
 - Mark a message as read when fetching a message from Microsoft Graph
 
-8.0.3
------
+## 8.0.3
 
 - Fix IMAP callback for `IDLE` connections (PR #313 closes issue #311)
 - Add warnings in documentation and log output for IMAP configuration changes introduced in 8.0.0 (Closes issue #309)
@@ -331,18 +944,15 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Separate version numbers in `__init__.py` and `setup.py` to allow `pip` to install directly from `git`
 - Update `dateparser` to 1.1.1 (closes issue #273)
 
-8.0.2 (yanked)
---------------
+## 8.0.2 (yanked)
 
 - Strip leading and trailing whitespaces from Gmail scopes (Closes issue #310)
 
-8.0.1 (yanked)
---------------
+## 8.0.1 (yanked)
 
 - Fix `ModuleNotFoundError` by adding `parsedmarc.mail` to the list of packages in `setup.py` (PR #308)
 
-8.0.0 (yanked)
---------------
+## 8.0.0 (yanked)
 
 - Update included copy of `dbip-country-lite.mmdb` to the 2022-04 release
 - Add support for Microsoft/Office 365 via Microsoft Graph API (PR #301 closes issue #111)
@@ -351,14 +961,12 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Remove usage of `logging.basicConfig` (PR #285)
 - Add support for the Gmail API (PR #284 and PR #307 close issue #96)
 
-7.1.1
------
+## 7.1.1
 
 - Actually include `dbip-country-lite.mmdb` file in the `parsedmarc.resources` package (PR #281)
 - Update `dbip-country-lite.mmdb` to the 2022-01 release
 
-7.1.0
------
+## 7.1.0
 
 - A static copy of the DBIP Country Lite database is now included for use when a copy of the MaxMind GeoLite2 Country database is not installed (Closes #275)
 - Add `ip_db_path` to as a parameter and `general` setting for a custom IP geolocation database location (Closes #184)
@@ -369,13 +977,11 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Add support for syslog output (PR #263 closes #227)
 - Do not print TQDDM progress bar when running in a no-interactive TTY (PR #264)
 
-7.0.1
------
+## 7.0.1
 
 - Fix startup error (PR #254)
 
-7.0.0
------
+## 7.0.0
 
 - Fix issue #221: Crash when handling invalid reports without root node (PR #248)
 - Use UTC datetime objects for Elasticsearch output (PR #245)
@@ -387,8 +993,7 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Wait for 5 seconds before attempting to reconnect to an IMAP server (PR #217)
 - Add option to process messages in batches (PR #222)
 
-6.12.0
-------
+## 6.12.0
 
 - Limit output filename length to 100 characters (PR #199)
 - Add basic auth support for Elasticsearch (PR #191)
@@ -398,8 +1003,7 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Require `dnspython>=2.0.0`
   - Drop Python 3.5 support
 
-6.11.0
-------
+## 6.11.0
 
 - Fix parsing failure for some valid forensic reports (PR #170)
 - Fix double count of messages in the Grafana dashboard (PR #182)
@@ -408,8 +1012,7 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Fix IMAP debugging output
 - Fix `User-Agent` string
 
-6.10.0
-------
+## 6.10.0
 
 - Ignore unknown forensic report fields when generating CSVs (Closes issue #148)
 - Fix crash on IMAP timeout (PR #164 - closes issue #163)
@@ -417,89 +1020,74 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Add support for Elasticsearch 7.0 (PR #161 - closes issue #149)
 - Remove temporary workaround for DMARC aggregate report records missing a SPF domain fields
 
-6.9.0
------
+## 6.9.0
 
 - Use system nameservers instead of Cloudflare by default
 - Parse aggregate report records with missing SPF domains
 
-6.8.2
------
+## 6.8.2
 
 - Require `mailsuite>=1.5.4`
 
-6.8.1
------
+## 6.8.1
 
 - Use `match_phrase` instead of `match` when looking for existing strings in Elasticsearch
 
-6.8.0
------
+## 6.8.0
 
 - Display warning when `GeoLite2-Country.mmdb` is missing, instead of trying to download it
 - Add documentation for MaxMind `geoipupdate` changes on January 30th, 2019 (closes issues #137 and #139)
 - Require `mail-parser>=3.11.0`
 
-6.7.4
------
+## 6.7.4
 
 - Update dependencies
 
-6.7.3
------
+## 6.7.3
 
-- Make `dkim_aligned` and `spf_aligned` case insensitive (PR #132)
+- Make `dkim_aligned` and `spf_aligned` case-insensitive (PR #132)
 
-6.7.2
------
+## 6.7.2
 
 - Fix SPF results field in CSV output (closes issue #128)
 
-6.7.1
------
+## 6.7.1
 
 - Parse forensic email samples with non-standard date headers
 - Graceful handling of a failure to download the GeoIP database (issue #123)
 
-6.7.0
------
+## 6.7.0
 
 - Fix typos (PR #119)
 - Make CSV output match JSON output (Issue # 22)
 - Graceful processing of invalid aggregate DMARC reports (PR #122)
 - Remove Python 3.4 support
 
-6.6.1
------
+## 6.6.1
 
 - Close files after reading them
 
-6.6.0
------
+## 6.6.0
 
 - Set a configurable default IMAP timeout of 30 seconds
 - Set a configurable maximum of 4 IMAP timeout retry attempts
 - Add support for reading ``MBOX`` files
 - Set a configurable Elasticsearch timeout of 60 seconds
 
-6.5.5
------
+## 6.5.5
 
-- Set set minimum `publicsuffix2` version
+- Set minimum `publicsuffix2` version
 
-6.5.4
------
+## 6.5.4
 
 - Bump required `mailsuite` version to `1.2.1`
 
-6.5.3
------
+## 6.5.3
 
 - Fix typos in the CLI documentation
 - Bump required `mailsuite` version to `1.1.1`
 
-6.5.2
------
+## 6.5.2
 
 - Merge PR #100 from michaeldavie
   - Correct a bug introduced in 6.5.1 that caused only the last record's data
@@ -511,8 +1099,7 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
   hierarchy separators
   - Prepend the namespace to the folder path when required
 
-6.5.1
------
+## 6.5.1
 
 - Merge PR #98 from michaeldavie
   - Add functions
@@ -520,8 +1107,7 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
     - `parsed_forensic_reports_to_csv_row(reports)`
 - Require `dnspython>=1.16.0`
 
-6.5.0
------
+## 6.5.0
 
 - Move mail processing functions to the
   [`mailsuite`](https://seanthegeek.github.io/mailsuite/) package
@@ -531,8 +1117,7 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Log the current file path being processed when `--debug` is used
   (closes issue #95)
 
-6.4.2
------
+## 6.4.2
 
 - Do not attempt to convert `org_name` to a base domain if `org_name` contains
   a space (closes issue #94)
@@ -540,58 +1125,48 @@ Removed improper spaces from  `base_reverse_dns_map.csv` (Closes #612)
 - Provide a more helpful warning message when `GeoLite2-Country.mmdb` is
   missing
 
-6.4.1
------
+## 6.4.1
 
 - Raise `utils.DownloadError` exception when a GeoIP database or Public
   Suffix List (PSL) download fails (closes issue #73)
 
-6.4.0
------
+## 6.4.0
 
 - Add ``number_of_shards`` and ``number_of_replicas`` as possible options
 in the ``elasticsearch`` configuration file section (closes issue #78)
 
-6.3.7
------
+## 6.3.7
 
 - Work around some unexpected IMAP responses reported in issue #75
 
-6.3.6
------
+## 6.3.6
 
 - Work around some unexpected IMAP responses reported in issue #70
 - Show correct destination folder in debug logs when moving aggregate reports
 
-6.3.5
------
+## 6.3.5
 
 - Normalize `Delivery-Result` value in forensic/failure reports (issue #76)
   Thanks Freddie Leeman of URIports for the troubleshooting assistance
 
-6.3.4
------
+## 6.3.4
 
 - Fix Elasticsearch index creation (closes issue #74)
 
-6.3.3
------
+## 6.3.3
 
 - Set `number_of_shards` and `number_of_replicas` to `1` when creating indexes
 - Fix dependency conflict
 
-6.3.2
------
+## 6.3.2
 
 - Fix the `monthly_indexes` option in the `elasticsearch` configuration section
 
-6.3.1
------
+## 6.3.1
 
 - Fix `strip_attachment_payloads` option
 
-6.3.0
------
+## 6.3.0
 
 - Fix IMAP IDLE response processing for some mail servers (#67)
 - Exit with a critical error when required settings are missing (#68)
@@ -602,109 +1177,90 @@ in the ``elasticsearch`` configuration file section (closes issue #78)
 - Suppress `mailparser` logging output
 - Suppress `msgconvert` warnings
 
-6.2.2
------
+## 6.2.2
 
 - Fix crash when trying to save forensic reports with missing fields to Elasticsearch
 
-6.2.1
------
+## 6.2.1
 
 - Add missing `tqdm` dependency to `setup.py`
 
-6.2.0
------
+## 6.2.0
 
-- Add support for multi-process parallelized processing via CLI (Thanks zscholl - PR #62)
+- Add support for multiprocess parallelized processing via CLI (Thanks zscholl - PR #62)
 - Save sha256 hashes of attachments in forensic samples to Elasticsearch
 
-6.1.8
------
+## 6.1.8
 
 - Actually fix GeoIP lookups
 
-6.1.7
------
+## 6.1.7
 
 - Fix GeoIP lookups
 
-6.1.6
------
+## 6.1.6
 
 - Better GeoIP error handling
 
-6.1.5
------
+## 6.1.5
 
 - Always use Cloudflare's nameservers by default instead of Google's
 - Avoid re-downloading the Geolite2 database (and tripping their DDoS protection)
 - Add `geoipupdate` to install instructions
 
-6.1.4
------
+## 6.1.4
 
 - Actually package requirements
 
-6.1.3
------
+## 6.1.3
 
 - Fix package requirements
 
-6.1.2
------
+## 6.1.2
 
 - Use local Public Suffix List file instead of downloading it
 - Fix argument name for `send_email()` (closes issue #60)
 
-6.1.1
------
+## 6.1.1
 
 - Fix aggregate report processing
 - Check for the existence of a configuration file if a path is supplied
 - Replace `publicsuffix` with `publicsuffix2`
 - Add minimum versions to requirements
 
-6.1.0
------
+## 6.1.0
 
 - Fix aggregate report email parsing regression introduced in 6.0.3 (closes issue #57)
 - Fix Davmail support (closes issue #56)
 
-6.0.3
------
+## 6.0.3
 
 - Don't assume the report is the last part of the email message (issue #55)
 
-6.0.2
-----
+## 6.0.2
 
 - IMAP connectivity improvements (issue #53)
 - Use a temp directory for temp files (issue #54)
 
-6.0.1
------
+## 6.0.1
 
 - Fix Elasticsearch output (PR #50 - andrewmcgilvray)
 
-6.0.0
------
+## 6.0.0
 
 - Move options from CLI to a config file (see updated installation documentation)
 - Refactoring to make argument names consistent
 
-5.3.0
------
+## 5.3.0
 
 - Fix crash on invalid forensic report sample (Issue #47)
 - Fix DavMail support (Issue #45)
 
-5.2.1
------
+## 5.2.1
 
 - Remove unnecessary debugging code
 
-5.2.0
------
+## 5.2.0
 
 - Add filename and line number to logging output
 - Improved IMAP error handling
@@ -721,44 +1277,37 @@ in the ``elasticsearch`` configuration file section (closes issue #78)
   --log-file LOG_FILE   output logging to a file
   ```
 
-5.1.3
------
+## 5.1.3
 
 - Remove `urllib3` version upper limit
 
-5.1.2
------
+## 5.1.2
 
-- Workaround unexpected Office365/Exchange IMAP responses
+- Workaround unexpected Office 365/Exchange IMAP responses
 
-5.1.1
------
+## 5.1.1
 
 - Bugfix: Crash when parsing invalid forensic report samples (#38)
 - Bugfix: Crash when IMAP connection is lost
 - Increase default Splunk HEC response timeout to 60 seconds
 
-5.1.0
------
+## 5.1.0
 
 - Bugfix: Submit aggregate dates to Elasticsearch as lists, not tuples
 - Support `elasticsearch-dsl<=6.3.0`
 - Add support for TLS/SSL and username/password auth to Kafka
 
-5.0.2
------
+## 5.0.2
 
 - Revert to using `publicsuffix` instead of `publicsuffix2`
 
-5.0.1
------
+## 5.0.1
 
 - Use `publixsuffix2` (closes issue #4)
 - Add Elasticsearch to automated testing
 - Lock `elasticsearch-dsl` required version to `6.2.1` (closes issue #25)
 
-5.0.0
------
+## 5.0.0
 
 **Note**: Re-importing `kibana_saved_objects.json` in Kibana [is required](https://domainaware.github.io/parsedmarc/#upgrading-kibana-index-patterns) when upgrading to this version!
 
@@ -774,26 +1323,22 @@ forensic/failure/ruf report
 - Save data in separate indexes each day to make managing data retention easier
 - Cache DNS queries in memory
 
-4.4.1
------
+## 4.4.1
 
 - Don't crash if Elasticsearch returns an unexpected result (workaround for issue #31)
 
-4.4.0
------
+## 4.4.0
 
 - Packaging fixes
 
-4.3.9
------
+## 4.3.9
 
 - Kafka output improvements
   - Moved some key values (`report_id`, `org_email`, `org_name`) higher in the JSON structure
   - Recreated the `date_range` values from the ES client for easier parsing.
   - Started sending individual record slices. Kafka default message size is 1 MB, some aggregate reports were exceeding this. Now it appends meta-data and sends record by record.
 
-4.3.8
------
+## 4.3.8
 
 - Fix decoding of attachments inside forensic samples
 - Add CLI option `--imap-skip-certificate-verification`
@@ -801,24 +1346,20 @@ forensic/failure/ruf report
 and `watch_inbox()`
 - Debug logging improvements
 
-4.3.7
------
+## 4.3.7
 
 - When checking an inbox, always recheck for messages when processing is
 complete
 
-4.3.6
------
+## 4.3.6
 
 - Be more forgiving for forensic reports with missing fields
 
-4.3.5
------
+## 4.3.5
 
 - Fix base64 attachment decoding (#26)
 
-4.3.4
------
+## 4.3.4
 
 - Fix crash on empty aggregate report comments (brakhane - #25)
 - Add SHA256 hashes of attachments to output
@@ -826,24 +1367,20 @@ complete
 `--strip-attachment-payloads` option to the CLI (#23)
 - Set `urllib3` version requirements to match `requests`
 
-4.3.3
------
+## 4.3.3
 
 - Fix forensic report email processing
 
-4.3.2
------
+## 4.3.2
 
 - Fix normalization of the forensic sample from address
 
-4.3.1
------
+## 4.3.1
 
 - Fix parsing of some emails
 - Fix duplicate forensic report search for Elasticsearch
 
-4.3.0
------
+## 4.3.0
 
 - Fix bug where `parsedmarc` would always try to save to Elastic search,
   even if only `--hec` was used
@@ -862,37 +1399,31 @@ complete
   - `human_timestamp_to_timestamp(human_timestamp)`
   - `parse_email(data)`
 
-4.2.0
-------
+## 4.2.0
 
 - Save each aggregate report record as a separate Splunk event
 - Fix IMAP delete action (#20)
 - Suppress Splunk SSL validation warnings
 - Change default logging level to `WARNING`
 
-4.1.9
------
+## 4.1.9
 
 - Workaround for forensic/ruf reports that are missing `Arrival-Date` and/or
 `Reported-Domain`
 
-4.1.8
------
+## 4.1.8
 
 - Be more forgiving of weird XML
 
-4.1.7
------
+## 4.1.7
 
 - Remove any invalid XML schema tags before parsing the XML (#18)
 
-4.1.6
------
+## 4.1.6
 
 - Fix typo in CLI parser
 
-4.1.5
------
+## 4.1.5
 
 - Only move or delete IMAP emails after they all have been parsed
 - Move/delete messages one at a time - do not exit on error
@@ -900,49 +1431,41 @@ complete
 `get_dmarc_reports_from_inbox()`
 - Add`--imap-port` and `--imap-no-ssl` CLI options
 
-4.1.4
------
+## 4.1.4
 
 - Change default logging level to `ERROR`
 
-4.1.3
------
+## 4.1.3
 
 - Fix crash introduced in 4.1.0 when creating Elasticsearch indexes (Issue #15)
 
-4.1.2
------
+## 4.1.2
 
 - Fix packaging bug
 
-4.1.1
------
+## 4.1.1
 
 - Add splunk instructions
 - Reconnect reset IMAP connections when watching a folder
 
-4.1.0
------
+## 4.1.0
 
 - Add options for Elasticsearch prefixes and suffixes
 - If an aggregate report has the invalid `disposition` value `pass`, change
 it to `none`
 
-4.0.2
------
+## 4.0.2
 
 - Use report timestamps for Splunk timestamps
 
-4.0.1
------
+## 4.0.1
 
 - When saving aggregate reports in Elasticsearch store `domain` in
 `published_policy`
 - Rename `policy_published` to `published_policy`when saving aggregate
 reports to Splunk
 
-4.0.0
------
+## 4.0.0
 
 - Add support for sending DMARC reports to a Splunk HTTP Events
 Collector (HEC)
@@ -955,51 +1478,44 @@ system path
 - Add `--outgoing-port` and  `--outgoing-ssl` options
 - Fall back to plain text SMTP if `--outgoing-ssl` is not used and `STARTTLS`
 is not supported by the server
-- Always use `\n` as the newline when generating CSVs
-- Workaround for random Exchange/Office365 `Server Unavailable` IMAP errors
+- Always use `
+` as the newline when generating CSVs
+- Workaround for random Exchange/Office 365 `Server Unavailable` IMAP errors
 
-3.9.7
------
+## 3.9.7
 
 - Completely reset IMAP connection when a broken pipe is encountered
 
-3.9.6
------
+## 3.9.6
 
 - Finish incomplete broken pipe fix
 
-3.9.5
------
+## 3.9.5
 
 - Refactor to use a shared IMAP connection for inbox watching and message
 downloads
 
 - Gracefully recover from broken pipes in IMAP
 
-3.9.4
------
+## 3.9.4
 
 - Fix moving/deleting emails
 
-3.9.3
------
+## 3.9.3
 
 - Fix crash when forensic reports are missing `Arrival-Date`
 
-3.9.2
------
+## 3.9.2
 
 - Fix PEP 8 spacing
 - Update build script to fail when CI tests fail
 
-3.9.1
------
+## 3.9.1
 
 - Use `COPY` and delete if an IMAP server does not support `MOVE`
 (closes issue #9)
 
-3.9.0
------
+## 3.9.0
 
 - Reduce IMAP `IDLE` refresh rate to 5 minutes to avoid session timeouts in
 Gmail
@@ -1008,59 +1524,49 @@ Gmail
 - Fix example NGINX configuration in the installation documentation
 (closes issue #6)
 
-3.8.2
------
+## 3.8.2
 
 - Fix `nameservers` option (mikesiegel)
 - Move or delete invalid report emails in an IMAP inbox (closes issue #7)
 
-3.8.1
------
+## 3.8.1
 
 - Better handling of `.msg` files when `msgconvert` is not installed
 
-3.8.0
------
+## 3.8.0
 
 - Use `.` instead of `/` as the IMAP folder hierarchy separator when `/`
 does not work - fixes dovecot support (#5)
 - Fix parsing of base64-encoded forensic report data
 
-3.7.3
------
+## 3.7.3
 
 - Fix saving attachment from forensic sample to Elasticsearch
 
-3.7.2
------
+## 3.7.2
 
-- Change uses uses of the `DocType` class to `Document`, to properly support `elasticsearch-dsl` `6.2.0` (this also fixes use in pypy)
+- Change uses of the `DocType` class to `Document`, to properly support `elasticsearch-dsl` `6.2.0` (this also fixes use in pypy)
 - Add documentation for installation under pypy
 
-3.7.1
------
+## 3.7.1
 
 - Require `elasticsearch>=6.2.1,<7.0.0` and `elasticsearch-dsl>=6.2.1,<7.0.0`
 - Update for class changes in `elasticsearch-dsl` `6.2.0`
 
-3.7.0
------
+## 3.7.0
 
 - Fix bug where PSL would be called before it was downloaded if the PSL was
 older than 24 Hours
 
-3.6.1
------
+## 3.6.1
 
 - Parse aggregate reports with missing SPF domain
 
-3.6.0
------
+## 3.6.0
 
 - Much more robust error handling
 
-3.5.1
------
+## 3.5.1
 
 - Fix dashboard message counts for source IP addresses visualizations
 - Improve dashboard loading times
@@ -1068,43 +1574,36 @@ older than 24 Hours
 - Add country rankings to the dashboards
 - Fix crash when parsing report with empty <auth_results></auth_results>
 
-3.5.0
------
+## 3.5.0
 
 - Use Cloudflare's public DNS resolvers by default instead of Google's
 - Fix installation from virtualenv
 - Fix documentation typos
 
-3.4.1
------
+## 3.4.1
 
 - Documentation fixes
 - Fix console output
 
-3.4.0
------
+## 3.4.0
 
 - Maintain IMAP IDLE state when watching the inbox
 - The `-i`/`--idle` CLI option is now `-w`/`--watch`
 - Improved Exception handling and documentation
 
-3.3.0
------
+## 3.3.0
 
 - Fix errors when saving to Elasticsearch
 
-3.2.0
------
+## 3.2.0
 
 - Fix existing aggregate report error message
 
-3.1.0
------
+## 3.1.0
 
 - Fix existing aggregate report query
 
-3.0.0
------
+## 3.0.0
 
 New features
 
@@ -1120,8 +1619,7 @@ file extension
 - If an aggregate report's `org_name` is a FQDN, the base is used
 - Normalize aggregate report IDs
 
-2.1.2
------
+## 2.1.2
 
 - Rename `parsed_dmarc_forensic_reports_to_csv()` to
  `parsed_forensic_reports_to_csv()` to match other functions
@@ -1129,25 +1627,21 @@ file extension
  `parsed_aggregate_reports_to_csv()` to match other functions
 - Use local time when generating the default email subject
 
-2.1.1
------
+## 2.1.1
 
 - Documentation fixes
 
-2.1.0
------
+## 2.1.0
 
 - Add `get_report_zip()` and `email_results()`
 - Add support for sending report emails via the command line
 
-2.0.1
------
+## 2.0.1
 
 - Fix documentation
 - Remove Python 2 code
 
-2.0.0
------
+## 2.0.0
 
 New features
 
@@ -1162,33 +1656,27 @@ Changes
 - `-o`/`--output` option is now a path to an output directory, instead of an
   output file
 
-1.1.0
------
+## 1.1.0
 
 - Add `extract_xml()` and `human_timestamp_to_datetime` methods
 
-1.0.5
------
+## 1.0.5
 
 - Prefix public suffix and GeoIP2 database filenames with `.`
 - Properly format errors list in CSV output
 
-1.0.3
------
+## 1.0.3
 
 - Fix documentation formatting
 
-1.0.2
------
+## 1.0.2
 
 - Fix more packaging flaws
 
-1.0.1
------
+## 1.0.1
 
 - Fix packaging flaw
 
-1.0.0
------
+## 1.0.0
 
 - Initial release

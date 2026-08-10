@@ -1,0 +1,76 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/lifeguardpress/parsedmarc
+  tag: master
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: repo-auth
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+
+externalSecrets:
+  enabled: true
+  apiVersion: external-secrets.io/v1
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-gsm-prod
+    kind: ClusterSecretStore
+  remoteKey: dmarc
+  elasticsearch:
+    secretName: es-credentials
+    properties:
+      apiKey: elastic.api_key
+      host: elastic.host
+      port: elastic.port
+  gmail:
+    secretName: gmail-credentials
+    properties:
+      credentialsJson: gmail.service-account-json
+      delegatedUser: gmail.delegated-user
+  kibana:
+    secretName: kibana-credentials
+    properties:
+      url: kibana.url
+      username: kibana.username
+      password: kibana.password
+
+config:
+  general:
+    saveAggregate: true
+    saveForensic: true
+  gmail:
+    includeSpamTrash: false
+  mailbox:
+    reportsFolder: INBOX
+    watch: true
+    archive: true
+    archiveFolder: Processed
+    delete: false
+  elasticsearch:
+    scheme: https
+    indexSuffix: dmarc
+    numberOfShards: 1
+    numberOfReplicas: 1
+
+dashboardImport:
+  # The original single-run Job was applied manually after Kibana credentials
+  # existed. Keep that behavior by default; enable it explicitly when needed.
+  enabled: false
+  image:
+    repository: curlimages/curl
+    tag: 8.9.1
+    pullPolicy: IfNotPresent
+  sourceUrl: https://raw.githubusercontent.com/domainaware/parsedmarc/master/kibana/export.ndjson
+

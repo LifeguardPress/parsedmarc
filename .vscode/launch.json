@@ -12,6 +12,20 @@
       "console": "integratedTerminal"
     },
     {
+      "name": "tests.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "tests.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "sample",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "parsedmarc.cli",
+      "args": ["samples/private/sample"]
+    },
+    {
       "name": "sortlists.py",
       "type": "debugpy",
       "request": "launch",

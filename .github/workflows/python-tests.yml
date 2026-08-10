@@ -5,17 +5,48 @@ permissions:
 
 on:
   push:
-    branches: [ build ]
+    branches: [ master ]
   pull_request:
-    branches: [ build ]
+    branches: [ master ]
 
 jobs:
-  build:
-    runs-on: arc-runner-set-01
+  lint-docs-build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.13"
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # postgresql extra included so pyright can resolve the optional
+        # psycopg import in parsedmarc/postgres.py
+        pip install .[build,postgresql]
+    - name: Check code style
+      run: |
+        ruff check .
+        ruff format --check .
+    - name: Check types
+      run: |
+        pyright
+    - name: Test building documentation
+      run: |
+        cd docs
+        make html
+    - name: Test building packages
+      run: |
+        hatch build
+
+  test:
+    needs: lint-docs-build
+    runs-on: ubuntu-latest
 
     services:
       elasticsearch:
-        image: elasticsearch:8.18.2
+        image: elasticsearch:8.19.7
         env:
           discovery.type: single-node
           cluster.name: parsedmarc-cluster
@@ -30,41 +61,44 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install system dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y libemail-outlook-message-perl
+        sudo apt-get -q update
+        sudo apt-get -qy install libemail-outlook-message-perl
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
         pip install .[build]
-    - name: Test building documentation
-      run: |
-        cd docs
-        make html
-    - name: Check code style
-      run: |
-        ruff check .
     - name: Run unit tests
       run: |
-        pytest --cov --cov-report=xml tests.py
+        python -m pytest --cov --cov-report=xml --junitxml=junit.xml -o junit_family=legacy tests/
     - name: Test sample DMARC reports
       run: |
         pip install -e .
         parsedmarc --debug -c ci.ini samples/aggregate/*
-        parsedmarc --debug -c ci.ini samples/forensic/*
+        parsedmarc --debug -c ci.ini samples/failure/*
     - name: Test building packages
       run: |
         hatch build
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
       with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+    - name: Upload test results to Codecov
+       # Feeds Codecov Test Analytics (flaky-test detection, per-test
+       # history). Runs even on test failure so failed cases still get
+      # reported. Uses the same CODECOV_TOKEN as the coverage upload.
+      if: ${{ !cancelled() }}
+      uses: codecov/test-results-action@v1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./junit.xml

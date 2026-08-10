@@ -1,0 +1,53 @@
+{{- if .Values.dashboardImport.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "parsedmarc.fullname" . }}-dashboard-import
+  labels:
+    {{- include "parsedmarc.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        {{- include "parsedmarc.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: import
+          image: "{{ .Values.dashboardImport.image.repository }}:{{ .Values.dashboardImport.image.tag }}"
+          imagePullPolicy: {{ .Values.dashboardImport.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          env:
+            - name: KIBANA_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "parsedmarc.kibanaSecretName" . }}
+                  key: KIBANA_URL
+            - name: KIBANA_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "parsedmarc.kibanaSecretName" . }}
+                  key: KIBANA_USER
+            - name: KIBANA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "parsedmarc.kibanaSecretName" . }}
+                  key: KIBANA_PASSWORD
+          args:
+            - |
+              set -euo pipefail
+              echo "Downloading parsedmarc export.ndjson ..."
+              curl -fsSL -o /tmp/export.ndjson {{ .Values.dashboardImport.sourceUrl | quote }}
+              echo "Importing into Kibana Saved Objects ..."
+              curl -f -u "$KIBANA_USER:$KIBANA_PASSWORD" \
+                -H "kbn-xsrf: true" \
+                -F file=@/tmp/export.ndjson \
+                "$KIBANA_URL/api/kibana/saved_objects/_import?overwrite=true"
+              echo "Done."
+{{- end }}
+

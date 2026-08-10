@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "parsedmarc.fullname" . }}-config
+  labels:
+    {{- include "parsedmarc.labels" . | nindent 4 }}
+data:
+  parsedmarc.ini.tpl: |
+    [general]
+    save_aggregate = {{ .Values.config.general.saveAggregate }}
+    save_forensic = {{ .Values.config.general.saveForensic }}
+
+    [gmail_api]
+    credentials_file = /var/secrets/google/credentials.json
+    auth_mode = service_account
+    service_account_user = ${GMAIL_DELEGATED_ACCOUNT}
+    include_spam_trash = {{ .Values.config.gmail.includeSpamTrash }}
+
+    [mailbox]
+    reports_folder = {{ .Values.config.mailbox.reportsFolder }}
+    watch = {{ .Values.config.mailbox.watch }}
+    archive = {{ .Values.config.mailbox.archive }}
+    archive_folder = {{ .Values.config.mailbox.archiveFolder }}
+    delete = {{ .Values.config.mailbox.delete }}
+
+    [elasticsearch]
+    hosts = {{ .Values.config.elasticsearch.scheme }}://${ES_HOST}:${ES_PORT}
+    ssl = {{ eq .Values.config.elasticsearch.scheme "https" }}
+    apiKey = ${ES_API_KEY}
+    index_suffix = {{ .Values.config.elasticsearch.indexSuffix }}
+    number_of_shards = {{ .Values.config.elasticsearch.numberOfShards }}
+    number_of_replicas = {{ .Values.config.elasticsearch.numberOfReplicas }}

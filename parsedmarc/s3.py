@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import json
+from typing import Any
+
 import boto3
 
 from parsedmarc.log import logger
@@ -8,16 +12,16 @@ from parsedmarc.utils import human_timestamp_to_datetime
 
 
 class S3Client(object):
-    """A client for a Amazon S3"""
+    """A client for interacting with Amazon S3"""
 
     def __init__(
         self,
-        bucket_name,
-        bucket_path,
-        region_name,
-        endpoint_url,
-        access_key_id,
-        secret_access_key,
+        bucket_name: str,
+        bucket_path: str,
+        region_name: str,
+        endpoint_url: str,
+        access_key_id: str,
+        secret_access_key: str,
     ):
         """
         Initializes the S3Client
@@ -47,26 +51,37 @@ class S3Client(object):
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
         )
-        self.bucket = self.s3.Bucket(self.bucket_name)
+        self.bucket = self.s3.Bucket(self.bucket_name)  # type: ignore
 
-    def save_aggregate_report_to_s3(self, report):
+    def save_aggregate_report_to_s3(self, report: dict[str, Any]):
         self.save_report_to_s3(report, "aggregate")
 
-    def save_forensic_report_to_s3(self, report):
-        self.save_report_to_s3(report, "forensic")
+    def save_failure_report_to_s3(self, report: dict[str, Any]):
+        self.save_report_to_s3(report, "failure")
 
-    def save_smtp_tls_report_to_s3(self, report):
+    def save_smtp_tls_report_to_s3(self, report: dict[str, Any]):
         self.save_report_to_s3(report, "smtp_tls")
 
-    def save_report_to_s3(self, report, report_type):
+    def save_report_to_s3(self, report: dict[str, Any], report_type: str):
         if report_type == "smtp_tls":
-            report_date = report["begin_date"]
+            # SMTP TLS reports (RFC 8460) are flat — they have no
+            # `report_metadata` sub-object — and parse_smtp_tls_report_json
+            # stores begin_date as the ISO string from the report JSON
+            # (per SMTPTLSReport's TypedDict).
+            report_date = human_timestamp_to_datetime(report["begin_date"])
             report_id = report["report_id"]
+            metadata_source = {
+                "org_name": report.get("organization_name"),
+                "report_id": report.get("report_id"),
+                "begin_date": str(report.get("begin_date")),
+                "end_date": str(report.get("end_date")),
+            }
         else:
             report_date = human_timestamp_to_datetime(
                 report["report_metadata"]["begin_date"]
             )
             report_id = report["report_metadata"]["report_id"]
+            metadata_source = report["report_metadata"]
         path_template = "{0}/{1}/year={2}/month={3:02d}/day={4:02d}/{5}.json"
         object_path = path_template.format(
             self.bucket_path,
@@ -77,15 +92,26 @@ class S3Client(object):
             report_id,
         )
         logger.debug(
-            "Saving {0} report to s3://{1}/{2}".format(
-                report_type, self.bucket_name, object_path
-            )
+            f"Saving {report_type} report to s3://{self.bucket_name}/{object_path}"
         )
         object_metadata = {
             k: v
-            for k, v in report["report_metadata"].items()
-            if k in self.metadata_keys
+            for k, v in metadata_source.items()
+            if k in self.metadata_keys and v is not None
         }
         self.bucket.put_object(
-            Body=json.dumps(report), Key=object_path, Metadata=object_metadata
+            Body=json.dumps(report, default=str),
+            Key=object_path,
+            Metadata=object_metadata,
         )
+
+    def close(self):
+        """Clean up the boto3 resource."""
+        try:
+            if self.s3.meta is not None:
+                self.s3.meta.client.close()
+        except Exception:
+            pass
+
+    # Backward-compatible alias
+    save_forensic_report_to_s3 = save_failure_report_to_s3

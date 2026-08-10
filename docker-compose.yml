@@ -1,8 +1,6 @@
-version: '3.7'
-
 services:
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.3.1
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.7
     environment:
       - network.host=127.0.0.1
       - http.host=0.0.0.0
@@ -13,8 +11,12 @@ services:
       - bootstrap.memory_lock=true
       - xpack.security.enabled=false
       - xpack.license.self_generated.type=basic
+      # Without an explicit heap, ES sizes it to 50% of host RAM and mlocks it
+      # (bootstrap.memory_lock), which OOM-kills the container on large hosts.
+      # Override via ES_JAVA_OPTS in .env for smaller machines.
+      - ES_JAVA_OPTS=${ES_JAVA_OPTS:--Xms2g -Xmx2g}
     ports:
-      - 127.0.0.1:9200:9200
+      - "127.0.0.1:9200:9200"
     ulimits:
       memlock:
         soft: -1
@@ -30,7 +32,7 @@ services:
       retries: 24
 
   opensearch:
-    image: opensearchproject/opensearch:2.18.0
+    image: opensearchproject/opensearch:3
     environment:
       - network.host=127.0.0.1
       - http.host=0.0.0.0
@@ -41,7 +43,7 @@ services:
       - bootstrap.memory_lock=true
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
     ports:
-      - 127.0.0.1:9201:9200
+      - "127.0.0.1:9201:9200"
     ulimits:
       memlock:
         soft: -1
@@ -50,7 +52,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "curl -s -XGET http://localhost:9201/_cluster/health?pretty | grep status | grep -q '\\(green\\|yellow\\)'"
+          "curl -sk -u admin:${OPENSEARCH_INITIAL_ADMIN_PASSWORD} -XGET https://localhost:9200/_cluster/health?pretty | grep status | grep -q '\\(green\\|yellow\\)'"
         ]
       interval: 10s
       timeout: 10s

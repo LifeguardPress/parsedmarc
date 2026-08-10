@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "parsedmarc.fullname" . }}
+  labels:
+    {{- include "parsedmarc.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "parsedmarc.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "parsedmarc.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      restartPolicy: Always
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: cfg
+          configMap:
+            name: {{ include "parsedmarc.fullname" . }}-config
+        - name: work
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+        - name: google-secrets
+          secret:
+            secretName: {{ include "parsedmarc.gmailSecretName" . }}
+        - name: es-secrets
+          secret:
+            secretName: {{ include "parsedmarc.elasticsearchSecretName" . }}
+      initContainers:
+        - name: render-config
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          env:
+            - name: ES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "parsedmarc.elasticsearchSecretName" . }}
+                  key: ES_HOST
+            - name: ES_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "parsedmarc.elasticsearchSecretName" . }}
+                  key: ES_PORT
+            - name: ES_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "parsedmarc.elasticsearchSecretName" . }}
+                  key: ES_API_KEY
+            - name: GMAIL_DELEGATED_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "parsedmarc.gmailSecretName" . }}
+                  key: delegated_user
+          volumeMounts:
+            - name: cfg
+              mountPath: /config
+            - name: work
+              mountPath: /work
+          args:
+            - |
+              set -euo pipefail
+              echo "Rendering /work/config.ini from /config/parsedmarc.ini.tpl ..."
+              esc() { printf '%s' "$1" | sed -e 's/[\/&\\]/\\&/g'; }
+              ES_HOST_ESC="$(esc "$ES_HOST")"
+              ES_PORT_ESC="$(esc "$ES_PORT")"
+              ES_API_KEY_ESC="$(esc "$ES_API_KEY")"
+              GMAIL_DELEGATED_ACCOUNT_ESC="$(esc "$GMAIL_DELEGATED_ACCOUNT")"
+              sed -e "s|\${ES_HOST}|$ES_HOST_ESC|g" \
+                  -e "s|\${ES_PORT}|$ES_PORT_ESC|g" \
+                  -e "s|\${ES_API_KEY}|$ES_API_KEY_ESC|g" \
+                  -e "s|\${GMAIL_DELEGATED_ACCOUNT}|$GMAIL_DELEGATED_ACCOUNT_ESC|g" \
+                  /config/parsedmarc.ini.tpl > /work/config.ini
+      containers:
+        - name: parsedmarc
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-c", "/etc/parsedmarc/config.ini", "--debug"]
+          volumeMounts:
+            - name: work
+              mountPath: /etc/parsedmarc
+            - name: data
+              mountPath: /data
+            - name: google-secrets
+              mountPath: /var/secrets/google
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+

@@ -3,48 +3,55 @@
 ## CLI help
 
 ```text
-usage: parsedmarc [-h] [-c CONFIG_FILE] [--strip-attachment-payloads] [-o OUTPUT]
-                   [--aggregate-json-filename AGGREGATE_JSON_FILENAME]
-                   [--forensic-json-filename FORENSIC_JSON_FILENAME]
-                   [--aggregate-csv-filename AGGREGATE_CSV_FILENAME]
-                   [--forensic-csv-filename FORENSIC_CSV_FILENAME]
-                   [-n NAMESERVERS [NAMESERVERS ...]] [-t DNS_TIMEOUT] [--offline]
-                   [-s] [--verbose] [--debug] [--log-file LOG_FILE] [-v]
-                   [file_path ...]
+usage: parsedmarc [-h] [-c CONFIG_FILE] [-r] [--strip-attachment-payloads] [-o OUTPUT]
+                  [--aggregate-json-filename AGGREGATE_JSON_FILENAME] [--failure-json-filename FAILURE_JSON_FILENAME]
+                  [--smtp-tls-json-filename SMTP_TLS_JSON_FILENAME] [--aggregate-csv-filename AGGREGATE_CSV_FILENAME]
+                  [--failure-csv-filename FAILURE_CSV_FILENAME] [--smtp-tls-csv-filename SMTP_TLS_CSV_FILENAME]
+                  [-n NAMESERVERS [NAMESERVERS ...]] [-t DNS_TIMEOUT] [--dns-retries DNS_RETRIES] [--offline] [-s]
+                  [-w] [--verbose] [--debug] [--log-file LOG_FILE] [--no-prettify-json] [-v]
+                  [file_path ...]
 
- Parses DMARC reports
+Parses DMARC reports
 
- positional arguments:
-   file_path             one or more paths to aggregate or forensic report
-                         files, emails, or mbox files'
+positional arguments:
+  file_path             one or more paths to aggregate or failure report files, emails, mbox files, or directories
+                        containing them
 
- optional arguments:
-   -h, --help            show this help message and exit
-   -c CONFIG_FILE, --config-file CONFIG_FILE
-                         a path to a configuration file (--silent implied)
-   --strip-attachment-payloads
-                         remove attachment payloads from forensic report output
-   -o OUTPUT, --output OUTPUT
-                         write output files to the given directory
-   --aggregate-json-filename AGGREGATE_JSON_FILENAME
-                         filename for the aggregate JSON output file
-   --forensic-json-filename FORENSIC_JSON_FILENAME
-                         filename for the forensic JSON output file
-   --aggregate-csv-filename AGGREGATE_CSV_FILENAME
-                         filename for the aggregate CSV output file
-   --forensic-csv-filename FORENSIC_CSV_FILENAME
-                         filename for the forensic CSV output file
-   -n NAMESERVERS [NAMESERVERS ...], --nameservers NAMESERVERS [NAMESERVERS ...]
-                         nameservers to query
-   -t DNS_TIMEOUT, --dns_timeout DNS_TIMEOUT
-                         number of seconds to wait for an answer from DNS
-                         (default: 2.0)
-   --offline             do not make online queries for geolocation or DNS
-   -s, --silent          only print errors and warnings
-   --verbose             more verbose output
-   --debug               print debugging information
-   --log-file LOG_FILE   output logging to a file
-   -v, --version         show program's version number and exit
+options:
+  -h, --help            show this help message and exit
+  -c CONFIG_FILE, --config-file CONFIG_FILE
+                        a path to a configuration file (--silent implied)
+  -r, --recursive       search directories given as file_path recursively, and enable '**' recursion in glob patterns
+  --strip-attachment-payloads
+                        remove attachment payloads from failure report output
+  -o OUTPUT, --output OUTPUT
+                        write output files to the given directory
+  --aggregate-json-filename AGGREGATE_JSON_FILENAME
+                        filename for the aggregate JSON output file
+  --failure-json-filename FAILURE_JSON_FILENAME
+                        filename for the failure JSON output file
+  --smtp-tls-json-filename SMTP_TLS_JSON_FILENAME
+                        filename for the SMTP TLS JSON output file
+  --aggregate-csv-filename AGGREGATE_CSV_FILENAME
+                        filename for the aggregate CSV output file
+  --failure-csv-filename FAILURE_CSV_FILENAME
+                        filename for the failure CSV output file
+  --smtp-tls-csv-filename SMTP_TLS_CSV_FILENAME
+                        filename for the SMTP TLS CSV output file
+  -n NAMESERVERS [NAMESERVERS ...], --nameservers NAMESERVERS [NAMESERVERS ...]
+                        nameservers to query
+  -t DNS_TIMEOUT, --dns_timeout DNS_TIMEOUT
+                        number of seconds to wait for an answer from DNS (default: 2.0)
+  --dns-retries DNS_RETRIES
+                        number of times to retry DNS queries on timeout or other transient errors (default: 0)
+  --offline             do not make online queries for geolocation or DNS
+  -s, --silent          only print errors
+  -w, --warnings        print warnings in addition to errors
+  --verbose             more verbose output
+  --debug               print debugging information
+  --log-file LOG_FILE   output logging to a file
+  --no-prettify-json    output JSON in a single line without indentation
+  -v, --version         show program's version number and exit
 ```
 
 :::{note}
@@ -67,7 +74,7 @@ For example
 
 [general]
 save_aggregate = True
-save_forensic = True
+save_failure = True
 
 [imap]
 host = imap.example.com
@@ -106,7 +113,7 @@ mode = tcp
 
 [webhook]
 aggregate_url = https://aggregate_url.example.com
-forensic_url = https://forensic_url.example.com
+failure_url = https://failure_url.example.com
 smtp_tls_url = https://smtp_tls_url.example.com
 timeout = 60
 ```
@@ -116,24 +123,60 @@ The full set of configuration options are:
 - `general`
   - `save_aggregate` - bool: Save aggregate report data to
       Elasticsearch, Splunk and/or S3
-  - `save_forensic` - bool: Save forensic report data to
+  - `save_failure` - bool: Save failure report data to
       Elasticsearch, Splunk and/or S3
   - `save_smtp_tls` - bool: Save SMTP-STS report data to
       Elasticsearch, Splunk and/or S3
+  - `index_prefix_domain_map` - str: Path to a YAML file mapping
+      OpenSearch/Elasticsearch index prefixes to domain names
   - `strip_attachment_payloads` - bool: Remove attachment
       payloads from results
+  - `silent` - bool: Set this to `False` to output results to STDOUT
   - `output` - str: Directory to place JSON and CSV files in.  This is required if you set either of the JSON output file options.
+  - `archive_directory` - str: Optional. When set, successfully
+      processed report files given as local file/directory path
+      arguments are moved into
+      `<archive_directory>/<year>/<month>/<Aggregate|Failure|SMTP-TLS>/`
+      (year and month come from the report's own begin/arrival date, with
+      the month zero-padded). A successfully parsed report whose archive
+      date can't be determined is left in place with a logged warning.
+      Files that fail to parse as a report are moved to
+      `<archive_directory>/Invalid/`; files that fail for other reasons,
+      such as transient I/O errors, are left in place so a later run can
+      retry them. An existing destination file is never overwritten; a
+      numeric suffix is appended before the extension (e.g.
+      `report-1.xml`). This applies only to direct local file input —
+      reports fetched from mailboxes (IMAP, Microsoft Graph, Gmail API,
+      Maildir) use `[mailbox] archive_folder` instead, and mbox files are
+      never moved. Files already inside `archive_directory` are excluded
+      from processing, so the archive may safely live inside an input
+      directory. A failed move is logged and does not stop the run.
   - `aggregate_json_filename` - str: filename for the aggregate
       JSON output file
-  - `forensic_json_filename` - str: filename for the forensic
+  - `failure_json_filename` - str: filename for the failure
       JSON output file
   - `ip_db_path` - str: An optional custom path to a MMDB file
-      from MaxMind or DBIP
+      from IPinfo, MaxMind, or DBIP
+  - `ipinfo_url` - str: Overrides the default download URL for the
+      bundled IPinfo Lite MMDB (env var:
+      `PARSEDMARC_GENERAL_IPINFO_URL`). The pre-9.10 name `ip_db_url` is
+      still accepted as a deprecated alias and logs a warning.
+  - `ipinfo_api_token` - str: Optional [IPinfo Lite REST API] token. When
+      set, IP lookups hit the API first for the freshest country/ASN data
+      and fall back to the local MMDB on rate limit, quota exhaustion, or
+      network errors. An invalid token exits the process with a fatal error.
+      Ignored when `offline` is set. The Lite tier is free and has no
+      documented monthly request cap; see the IPinfo Lite docs for current
+      limits. (env var: `PARSEDMARC_GENERAL_IPINFO_API_TOKEN`)
   - `offline` - bool: Do not use online queries for geolocation
-      or DNS
-  - `always_use_local_files` - Disables the download of the reverse DNS map
+      or DNS. Also disables automatic downloading of the IP-to-country
+      database and reverse DNS map.
+  - `always_use_local_files` - Disables the download of the
+      IP-to-country database and reverse DNS map
   - `local_reverse_dns_map_path` - Overrides the default local file path to use for the reverse DNS map
   - `reverse_dns_map_url` - Overrides the default download URL for the reverse DNS map
+  - `local_psl_overrides_path` - Overrides the default local file path to use for the PSL overrides list
+  - `psl_overrides_url` - Overrides the default download URL for the PSL overrides list
   - `nameservers` - str: A comma separated list of
       DNS resolvers (Default: `[Cloudflare's public resolvers]`)
   - `dns_test_address` - str: a dummy address used for DNS pre-flight checks
@@ -141,13 +184,35 @@ The full set of configuration options are:
   - `dns_timeout` - float: DNS timeout period
   - `debug` - bool: Print debugging messages
   - `silent` - bool: Only print errors (Default: `True`)
+  - `fail_on_output_error` - bool: Exit with a non-zero status code if
+      any configured output destination fails while saving/publishing
+      reports (Default: `False`)
+
+    :::{note}
+    This option only controls the process exit code. Retaining mailbox
+    messages whose reports could not be saved is automatic and happens
+    either way — see
+    [Mailbox messages are only archived once the reports are saved](#mailbox-messages-are-only-archived-once-the-reports-are-saved).
+    :::
+
   - `log_file` - str: Write log messages to a file at this path
-  - `n_procs` - int: Number of process to run in parallel when
-      parsing in CLI mode (Default: `1`)
+  - `n_procs` - int: Number of processes to run in parallel when
+      parsing report files passed directly as CLI arguments, messages
+      in mbox files, and messages from mailbox connections (IMAP,
+      Microsoft Graph, Gmail API, Maildir), including watch mode
+      (Default: `1`)
 
     :::{note}
     Setting this to a number larger than one can improve
-    performance when processing thousands of files
+    performance when processing thousands of files or messages
+    :::
+
+    :::{note}
+    Only parsing is parallelized across worker processes. Fetching
+    messages, deduplicating reports, archiving/deleting mailbox
+    messages, and saving/publishing to outputs all stay sequential
+    in the main process. Each worker process keeps its own DNS/GeoIP
+    cache.
     :::
 
 - `mailbox`
@@ -160,14 +225,48 @@ The full set of configuration options are:
       messages as they arrive or poll MS Graph for new messages
   - `delete` - bool: Delete messages after processing them,
       instead of archiving them
+  - `delete_aggregate` - bool: Delete aggregate report messages
+      after processing them, instead of archiving them
+      (Default: the value of `delete`)
+  - `delete_failure` - bool: Delete failure report messages
+      after processing them, instead of archiving them
+      (Default: the value of `delete`)
+  - `delete_smtp_tls` - bool: Delete SMTP TLS report messages
+      after processing them, instead of archiving them
+      (Default: the value of `delete`)
+  - `delete_invalid` - bool: Delete messages that could not be
+      parsed, instead of archiving them in the `Invalid`
+      subfolder, where they can be inspected for debugging
+      (Default: the value of `delete`)
+
+    :::{note}
+    Each of these four options overrides `delete` for one kind of
+    message only, and the other three keep inheriting `delete`. So
+    `delete = True` combined with `delete_failure = False` archives
+    failure report messages while deleting processed aggregate and
+    SMTP TLS report messages — and unparseable ones, unless
+    `delete_invalid = False` is set as well.
+    :::
+
   - `test` - bool: Do not move or delete messages
   - `batch_size` - int: Number of messages to read and process
       before saving. Default `10`. Use `0` for no limit.
-  - `check_timeout` - int: Number of seconds to wait for a IMAP
+  - `check_timeout` - int: Number of seconds to wait for an IMAP
       IDLE response or the number of seconds until the next
       mail check (Default: `30`)
-  - `since` - str: Search for messages since certain time. (Examples: `5m|3h|2d|1w`) 
-      Acceptable units - {"m":"minutes", "h":"hours", "d":"days", "w":"weeks"}). 
+  - `max_unsaved_retries` - int: How many times a batch of messages
+      whose reports could not be saved is retried before its messages
+      are moved to the `Unsaved` archive subfolder instead of being
+      retried again (Default: `2`, i.e. the initial attempt plus two
+      retries). Use `0` to move messages on the first failed save;
+      negative values are rejected.
+      Failures are counted in memory, so the cap applies across watch-mode
+      checks within one long-running process, not across separate one-shot
+      runs. See
+      [Mailbox messages are only archived once the reports are saved](#mailbox-messages-are-only-archived-once-the-reports-are-saved)
+      below.
+  - `since` - str: Search for messages since certain time. (Examples: `5m|3h|2d|1w`)
+      Acceptable units - {"m":"minutes", "h":"hours", "d":"days", "w":"weeks"}.
       Defaults to `1d` if incorrect value is provided.
 - `imap`
   - `host` - str: The IMAP server hostname or IP address
@@ -195,14 +294,30 @@ The full set of configuration options are:
   - `password` - str: The IMAP password
 - `msgraph`
   - `auth_method` - str: Authentication method, valid types are
-      `UsernamePassword`, `DeviceCode`, or `ClientSecret`
-      (Default: `UsernamePassword`).
+      `UsernamePassword`, `DeviceCode`, `ClientSecret`, `Certificate`, or
+      `ClientAssertion` (Default: `UsernamePassword`).
   - `user` - str: The M365 user, required when the auth method is
       UsernamePassword
   - `password` - str: The user password, required when the auth
       method is UsernamePassword
   - `client_id` - str: The app registration's client ID
   - `client_secret` - str: The app registration's secret
+  - `certificate_path` - str: Path to a PEM or PKCS12 certificate
+      including the private key. Required when the auth method is
+      `Certificate`
+  - `certificate_password` - str: Optional password for the
+      certificate file when using `Certificate` auth
+  - `client_assertion` - str: A signed JWT client assertion, required
+      when the auth method is `ClientAssertion`
+
+    :::{note}
+    `client_assertion` is a static value, so it is only usable for as
+    long as the JWT it contains remains unexpired (assertions are
+    typically short-lived, on the order of minutes). It is best suited
+    to short one-shot runs; for long-running `watch` mode, prefer
+    `Certificate` or `ClientSecret` auth, which can refresh
+    indefinitely.
+    :::
   - `tenant_id` - str: The Azure AD tenant ID. This is required
       for all auth methods except UsernamePassword.
   - `mailbox` - str: The mailbox name. This defaults to the
@@ -210,6 +325,27 @@ The full set of configuration options are:
       could be a shared mailbox if the user has access to the mailbox
   - `graph_url` - str: Microsoft Graph URL.  Allows for use of National Clouds (ex Azure Gov)
       (Default: https://graph.microsoft.com)
+
+    :::{warning}
+    Setting `graph_url` alone is **not** sufficient for a national/sovereign
+    cloud tenant. It only changes the Microsoft Graph API root; the
+    Microsoft Entra ID (Azure AD) token endpoint used for authentication is
+    not currently configurable in parsedmarc or `mailsuite`, and always
+    defaults to the global `https://login.microsoftonline.com`. A true
+    national-cloud deployment also needs its own Entra ID endpoint, so
+    `graph_url` by itself only helps if your tenant is registered in the
+    global cloud but you specifically need to reach one of these Graph API
+    roots (per [Microsoft's national cloud deployment docs][ms-graph-clouds]):
+
+    | National cloud | Microsoft Graph URL | Entra ID endpoint (not configurable here) |
+    |---|---|---|
+    | Global (default) | `https://graph.microsoft.com` | `https://login.microsoftonline.com` |
+    | US Government L4 (GCC High) | `https://graph.microsoft.us` | `https://login.microsoftonline.us` |
+    | US Government L5 (DoD) | `https://dod-graph.microsoft.us` | `https://login.microsoftonline.us` |
+    | China, operated by 21Vianet | `https://microsoftgraph.chinacloudapi.cn` | `https://login.chinacloudapi.cn` |
+
+    [ms-graph-clouds]: https://learn.microsoft.com/en-us/graph/deployments
+    :::
   - `token_file` - str: Path to save the token file
       (Default: `.token`)
   - `allow_unencrypted_storage` - bool: Allows the Azure Identity
@@ -217,11 +353,44 @@ The full set of configuration options are:
       Even if enabled, the cache will always try encrypted storage first.
 
     :::{note}
+    `token_file` stores the serialized authentication record; the
+    underlying MSAL persistent token cache is separately named
+    `parsedmarc`, not `mailsuite`'s own default cache name. This is
+    deliberate: the Graph mailbox backend used to live directly in
+    parsedmarc, and moved into the `mailsuite` dependency in parsedmarc
+    9.11.0. Explicitly keeping the `parsedmarc` cache name means tokens
+    cached before that move keep working after upgrading — there is
+    nothing to migrate and no action needed on your part.
+    :::
+
+    :::{note}
     You must create an app registration in Azure AD and have an
     admin grant the Microsoft Graph `Mail.ReadWrite`
     (delegated) permission to the app. If you are using
     `UsernamePassword` auth and the mailbox is different from the
     username, you must grant the app `Mail.ReadWrite.Shared`.
+    :::
+
+    | Auth method | Reading (own mailbox) | Reading (shared mailbox) |
+    |---|---|---|
+    | `UsernamePassword` / `DeviceCode` (delegated) | `Mail.ReadWrite` | `Mail.ReadWrite.Shared` |
+    | `ClientSecret` / `Certificate` / `ClientAssertion` (application) | `Mail.ReadWrite` (application), scoped via `New-ApplicationAccessPolicy` | same as own mailbox — app-only access is scoped by policy, not by permission name |
+
+    :::{tip}
+    **Troubleshooting connections.** Run with `--verbose` to log a
+    redacted connection summary (auth method, tenant, client ID,
+    mailbox, Graph URL) before the connection attempt, and with
+    `--debug` to additionally surface the underlying library activity —
+    `azure.identity` token acquisition (including `AADSTS` error codes
+    from Entra ID, which distinguish a local configuration problem from
+    an Exchange Online-side one), Microsoft Graph SDK requests, and
+    `httpx` HTTP request lines. Secret values (passwords, client
+    secrets, certificate passwords) are never written to logs.
+    Connection, mailbox fetch, message send, and `--watch` failures
+    each log a single ERROR line naming the mailbox, tenant, auth
+    method, and the Graph `request-id`/`client-request-id` when
+    available — worth quoting verbatim when contacting Microsoft
+    support.
     :::
 
     :::{warning}
@@ -235,11 +404,128 @@ The full set of configuration options are:
     group and use that as the group id.
 
     ```powershell
-    New-ApplicationAccessPolicy -AccessRight RestrictAccess 
+    New-ApplicationAccessPolicy -AccessRight RestrictAccess
     -AppId "<CLIENT_ID>" -PolicyScopeGroupId "<MAILBOX>"
     -Description "Restrict access to dmarc reports mailbox."
     ```
 
+    The same application permission and mailbox scoping guidance
+    applies to the `Certificate` and `ClientAssertion` auth methods.
+
+    :::
+
+    **Sending the summary email via Microsoft Graph.**
+    When `[msgraph]` is configured and `[smtp]` has a `to` value but no
+    `host`, the periodic summary email is sent through the same
+    already-authenticated Graph mailbox connection used for reading
+    (`/users/{mailbox}/sendMail`), and a copy is saved to Sent Items.
+    When `[smtp] host` is set, SMTP is used regardless of whether
+    `[msgraph]` is also configured — SMTP is always preferred, with no
+    automatic fallback to Graph on SMTP failure.
+
+    Example config combining `[msgraph]` with a `[smtp]` section that
+    only sets `to`/`subject` (no `host`):
+
+    ```ini
+    [msgraph]
+    auth_method = Certificate
+    client_id = ...
+    tenant_id = ...
+    mailbox = dmarc-reports@example.com
+    certificate_path = /path/to/cert.pem
+
+    [smtp]
+    to = admin@example.com
+    subject = DMARC Summary
+    ```
+
+    Required Microsoft Graph permissions, in addition to the
+    reading-related permissions documented above:
+
+    | Auth method | Reading | Sending (own mailbox) | Sending (shared mailbox) |
+    |---|---|---|---|
+    | `UsernamePassword` / `DeviceCode` (delegated) | `Mail.ReadWrite` (+`.Shared` for shared) | `Mail.Send` | `Mail.Send.Shared` |
+    | `ClientSecret` / `Certificate` / `ClientAssertion` (application) | `Mail.ReadWrite` (application) | `Mail.Send` (application) | `Mail.Send` (application), scoped via `New-ApplicationAccessPolicy` |
+
+    :::{warning}
+    Graph-based sending is only confirmed to work with the app-only
+    auth methods (`ClientSecret`, `Certificate`, `ClientAssertion`).
+    The delegated auth methods (`UsernamePassword`, `DeviceCode`)
+    currently request only the `Mail.ReadWrite`(`.Shared`) scope when
+    authenticating, not `Mail.Send` — so a delegated connection's
+    access token will not carry `Mail.Send` even if an administrator
+    has granted it, and `/sendMail` calls are expected to fail with an
+    access-denied error regardless of what's granted in Azure AD. Use
+    an app-only auth method if you need Graph-based sending.
+    :::
+
+    **Minimal example configs.** Each auth method needs a different
+    minimum set of keys. These read-only examples omit `[smtp]`; see
+    above for adding Graph-based sending on top of any of them.
+
+    `UsernamePassword` (delegated, own mailbox):
+    ```ini
+    [msgraph]
+    auth_method = UsernamePassword
+    client_id = ...
+    client_secret = ...
+    user = dmarc-reports@example.com
+    password = ...
+    ```
+
+    `DeviceCode` (delegated, interactive sign-in on first run — `user`
+    is the account that signs in; `mailbox` is the shared mailbox it
+    reads, and only needs to differ from `user` to request
+    `Mail.ReadWrite.Shared` instead of plain `Mail.ReadWrite`):
+    ```ini
+    [msgraph]
+    auth_method = DeviceCode
+    client_id = ...
+    tenant_id = ...
+    user = signing-in-user@example.com
+    mailbox = dmarc-reports@example.com
+    ```
+
+    `ClientSecret` (app-only):
+    ```ini
+    [msgraph]
+    auth_method = ClientSecret
+    client_id = ...
+    tenant_id = ...
+    client_secret = ...
+    mailbox = dmarc-reports@example.com
+    ```
+
+    `Certificate` (app-only):
+    ```ini
+    [msgraph]
+    auth_method = Certificate
+    client_id = ...
+    tenant_id = ...
+    certificate_path = /path/to/cert.pem
+    mailbox = dmarc-reports@example.com
+    ```
+
+    `ClientAssertion` (app-only, short-lived JWT — see the note above
+    about its unsuitability for `watch` mode):
+    ```ini
+    [msgraph]
+    auth_method = ClientAssertion
+    client_id = ...
+    tenant_id = ...
+    client_assertion = ...
+    mailbox = dmarc-reports@example.com
+    ```
+
+    :::{tip}
+    **Troubleshooting.**
+
+    | Error | Cause | Fix |
+    |---|---|---|
+    | *"...needs permission to access resources in your organization that only an admin can grant"* / "Admin consent required" | A delegated auth method (`UsernamePassword`, `DeviceCode`) is authenticating with a scope (`Mail.ReadWrite` or `Mail.ReadWrite.Shared`) the tenant admin hasn't consented to yet. | Have an Entra ID admin grant consent: Azure Portal → **Enterprise Applications** → *your app* → **Permissions** → **Grant admin consent**, or `az ad app permission admin-consent --id <CLIENT_ID>`. This is separate from the `New-ApplicationAccessPolicy` step above, which only applies to app-only auth. |
+    | `ErrorItemNotFound: ... Default folder Root not found` | `mailsuite` can resolve the well-known folders (`Inbox`, `Archive`, `Drafts`, `Sent Items`, `Deleted Items`, `Junk Email`) even when a mailbox's folder hierarchy hasn't fully provisioned, but a **custom, non-well-known** `reports_folder` name still fails to resolve on such a mailbox. | Point `reports_folder` at (or under) one of the six well-known folder names above, or sign into the (shared) mailbox once via Outlook/OWA to force Exchange to provision it, then retry. |
+    | `RuntimeError: Event loop is closed` | Historical bug, fixed in `mailsuite` 2.0.2. Not reachable with the `mailsuite>=2.2.2` this project requires. | Confirm your installed `mailsuite` version is current (`pip show mailsuite`); upgrade if it's somehow pinned below 2.0.2. |
+    | Invalid/rejected timestamp in the `since`/`receivedDateTime` filter | Historical bug (parsedmarc [#706](https://github.com/domainaware/parsedmarc/pull/706)/[#708](https://github.com/domainaware/parsedmarc/pull/708)): older versions appended a spurious `Z` to an already-UTC-offset ISO timestamp. Fixed since parsedmarc 9.5.1/9.5.5. | Upgrade parsedmarc if you're on a version older than 9.5.5. |
     :::
 - `elasticsearch`
   - `hosts` - str: A comma separated list of hostnames and ports
@@ -252,11 +538,13 @@ The full set of configuration options are:
     :::
   - `user` - str: Basic auth username
   - `password` - str: Basic auth password
-  - `apiKey` - str: API key
+  - `api_key` - str: API key
   - `ssl` - bool: Use an encrypted SSL/TLS connection
     (Default: `True`)
   - `timeout` - float: Timeout in seconds (Default: 60)
   - `cert_path` - str: Path to a trusted certificates
+  - `skip_certificate_verification` - bool: Skip certificate
+    verification (not recommended)
   - `index_suffix` - str: A suffix to apply to the index names
   - `index_prefix` - str: A prefix to apply to the index names
   - `monthly_indexes` - bool: Use monthly indexes instead of daily indexes
@@ -264,6 +552,12 @@ The full set of configuration options are:
     creating the index (Default: `1`)
   - `number_of_replicas` - int: The number of replicas to use when
     creating the index (Default: `0`)
+  - `serverless` - bool: Set to `True` when targeting an Elastic Cloud
+    Serverless project. Serverless manages sharding and replication itself
+    and rejects the `number_of_shards` / `number_of_replicas` index settings
+    with HTTP 400. With this flag set, parsedmarc strips those keys from the
+    settings sent at index creation; any other settings (e.g.
+    `refresh_interval`) are passed through unchanged (Default: `False`)
 - `opensearch`
   - `hosts` - str: A comma separated list of hostnames and ports
     or URLs (e.g. `127.0.0.1:9200` or
@@ -275,11 +569,17 @@ The full set of configuration options are:
     :::
   - `user` - str: Basic auth username
   - `password` - str: Basic auth password
-  - `apiKey` - str: API key
+  - `api_key` - str: API key
+  - `auth_type` - str: Authentication type: `basic` (default) or `awssigv4` (the key `authentication_type` is accepted as an alias for this option)
+  - `aws_region` - str: AWS region for SigV4 authentication
+    (required when `auth_type = awssigv4`)
+  - `aws_service` - str: AWS service for SigV4 signing (Default: `es`)
   - `ssl` - bool: Use an encrypted SSL/TLS connection
     (Default: `True`)
   - `timeout` - float: Timeout in seconds (Default: 60)
   - `cert_path` - str: Path to a trusted certificates
+  - `skip_certificate_verification` - bool: Skip certificate
+    verification (not recommended)
   - `index_suffix` - str: A suffix to apply to the index names
   - `index_prefix` - str: A prefix to apply to the index names
   - `monthly_indexes` - bool: Use monthly indexes instead of daily indexes
@@ -301,27 +601,90 @@ The full set of configuration options are:
   - `skip_certificate_verification` - bool: Skip certificate
     verification (not recommended)
   - `aggregate_topic` - str: The Kafka topic for aggregate reports
-  - `forensic_topic` - str: The Kafka topic for forensic reports
+  - `failure_topic` - str: The Kafka topic for failure reports
 - `smtp`
-  - `host` - str: The SMTP hostname
+
+  The results email is only sent when at least one aggregate, failure,
+  or SMTP TLS report was parsed during the run; an empty run (e.g. an
+  empty inbox) skips the email instead of sending headers-only CSVs.
+
+  - `host` - str: The SMTP hostname. Required unless `[msgraph]` is
+    configured, in which case omitting it sends the summary via
+    Microsoft Graph instead — see "Sending the summary email via
+    Microsoft Graph" above.
   - `port` - int: The SMTP port (Default: `25`)
   - `ssl` - bool: Require SSL/TLS instead of using STARTTLS
   - `skip_certificate_verification` - bool: Skip certificate
     verification (not recommended)
-  - `user` - str: the SMTP username
-  - `password` - str: the SMTP password
-  - `from` - str: The From header to use in the email
+  - `user` - str: the SMTP username. SMTP-only; not used when sending
+    via Microsoft Graph.
+  - `password` - str: the SMTP password. SMTP-only; not used when
+    sending via Microsoft Graph.
+  - `from` - str: The From header to use in the email. SMTP-only.
+    When sent via Microsoft Graph, the message's `From` is always the
+    `[msgraph]` mailbox — `[smtp] from` has no effect.
   - `to` - list: A list of email addresses to send to
   - `subject` - str: The Subject header to use in the email
     (Default: `parsedmarc report`)
   - `attachment` - str: The ZIP attachment filenames
+    (Default: `DMARC-<YYYY-MM-DD>.zip`)
   - `message` - str: The email message
-    (Default: `Please see the attached parsedmarc report.`)
+    (Default: `Please see the attached DMARC results.`)
 
     :::{note}
     `%` characters must be escaped with another `%` character,
     so use `%%` wherever a `%` character is used.
     :::
+- `postgresql`
+  - `host` - str: The PostgreSQL server hostname or IP address.
+    Required unless `connection_string` is provided.
+  - `port` - int: The PostgreSQL server port (Default: `5432`)
+  - `user` - str: The database user name (Optional)
+  - `password` - str: The database user password (Optional)
+  - `database` - str: The database name (Optional)
+  - `connection_string` - str: A full libpq connection string or URI
+    (e.g. `postgresql://user:pass@host/dbname`). When provided,
+    all individual parameters above are ignored.
+
+  The PostgreSQL backend is an optional extra. Install it with
+  `pip install parsedmarc[postgresql]` (it pulls in `psycopg`); the
+  prebuilt binary wheels are not available for every platform, which is
+  why it is not a mandatory dependency. The prebuilt Docker image
+  (`ghcr.io/domainaware/parsedmarc`) already bundles this extra, so the
+  PostgreSQL backend works out of the box in the container — `psycopg`
+  ships `amd64` and `arm64` binary wheels, both of which the image
+  supports.
+
+  Tables are created automatically on first run using
+  `CREATE TABLE IF NOT EXISTS`, so no manual schema migration is needed
+  for fresh installations.
+
+  **Example configuration:**
+
+  ```ini
+  [postgresql]
+  host = localhost
+  port = 5432
+  user = parsedmarc
+  password = secret
+  database = parsedmarc
+  ```
+
+  Or using a DSN/URI:
+
+  ```ini
+  [postgresql]
+  connection_string = postgresql://parsedmarc:secret@localhost/parsedmarc
+  ```
+
+  Saving parsed data to PostgreSQL is controlled by the `[general]`
+  options `save_aggregate`, `save_failure`, and `save_smtp_tls`
+  (`save_forensic` is still accepted as a deprecated alias for
+  `save_failure`). These flags must be set to `True` for the
+  corresponding report types (aggregate DMARC, failure DMARC, and
+  SMTP TLS reports) or no data will be written to PostgreSQL, even if
+  this section is configured.
+
 - `s3`
   - `bucket` - str: The S3 bucket name
   - `path` - str: The path to upload reports to (Default: `/`)
@@ -331,15 +694,77 @@ The full set of configuration options are:
   - `secret_access_key` - str: The secret access key (Optional)
 - `syslog`
   - `server` - str: The Syslog server name or IP address
-  - `port` - int: The UDP port to use (Default: `514`)
+  - `port` - int: The port to use (Default: `514`)
+  - `protocol` - str: The protocol to use: `udp`, `tcp`, or `tls` (Default: `udp`)
+  - `cafile_path` - str: Path to CA certificate file for TLS server verification (Optional)
+  - `certfile_path` - str: Path to client certificate file for TLS authentication (Optional)
+  - `keyfile_path` - str: Path to client private key file for TLS authentication (Optional)
+  - `timeout` - float: Connection timeout in seconds for TCP/TLS (Default: `5.0`)
+  - `retry_attempts` - int: Number of retry attempts for failed connections (Default: `3`)
+  - `retry_delay` - int: Delay in seconds between retry attempts (Default: `5`)
+
+  **Example UDP configuration (default):**
+
+  ```ini
+  [syslog]
+  server = syslog.example.com
+  port = 514
+  ```
+
+  **Example TCP configuration:**
+
+  ```ini
+  [syslog]
+  server = syslog.example.com
+  port = 6514
+  protocol = tcp
+  timeout = 10.0
+  retry_attempts = 5
+  ```
+
+  **Example TLS configuration with server verification:**
+
+  ```ini
+  [syslog]
+  server = syslog.example.com
+  port = 6514
+  protocol = tls
+  cafile_path = /path/to/ca-cert.pem
+  timeout = 10.0
+  ```
+
+  **Example TLS configuration with mutual authentication:**
+
+  ```ini
+  [syslog]
+  server = syslog.example.com
+  port = 6514
+  protocol = tls
+  cafile_path = /path/to/ca-cert.pem
+  certfile_path = /path/to/client-cert.pem
+  keyfile_path = /path/to/client-key.pem
+  timeout = 10.0
+  retry_attempts = 3
+  retry_delay = 5
+  ```
+
 - `gmail_api`
   - `credentials_file` - str: Path to file containing the
       credentials, None to disable (Default: `None`)
   - `token_file` - str: Path to save the token file
       (Default: `.token`)
-      
+  - `auth_mode` - str: Authentication mode, `installed_app` (default)
+      or `service_account`
+  - `service_account_user` - str: Delegated mailbox user for Gmail
+      service account auth (required for domain-wide delegation). Also
+      accepted as `delegated_user` for backward compatibility.
+
     :::{note}
     credentials_file and token_file can be got with [quickstart](https://developers.google.com/gmail/api/quickstart/python).Please change the scope to `https://www.googleapis.com/auth/gmail.modify`.
+    :::
+    :::{note}
+    When `auth_mode = service_account`, `credentials_file` must point to a
+    Google service account key JSON file, and `token_file` is not used.
     :::
   - `include_spam_trash` - bool: Include messages in Spam and
       Trash when searching reports (Default: `False`)
@@ -357,11 +782,11 @@ The full set of configuration options are:
   - `dce` - str: The Data Collection Endpoint (DCE). Example: `https://{DCE-NAME}.{REGION}.ingest.monitor.azure.com`.
   - `dcr_immutable_id` - str: The immutable ID of the Data Collection Rule (DCR)
   - `dcr_aggregate_stream` - str: The stream name for aggregate reports in the DCR
-  - `dcr_forensic_stream` - str: The stream name for the forensic reports in the DCR
+  - `dcr_failure_stream` - str: The stream name for the failure reports in the DCR
   - `dcr_smtp_tls_stream` - str: The stream name for the SMTP TLS reports in the DCR
 
   :::{note}
-    Information regarding the setup of the Data Collection Rule can be found [here](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/tutorial-logs-ingestion-portal).
+    Information regarding the setup of the Data Collection Rule can be found [in the Azure documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/tutorial-logs-ingestion-portal).
     :::
 - `gelf`
   - `host` - str: The GELF server name or IP address
@@ -369,12 +794,12 @@ The full set of configuration options are:
   - `mode` - str: The GELF transport type to use. Valid modes: `tcp`, `udp`, `tls`
 
 - `maildir`
-  - `maildir_path` - str: Full path for mailbox maidir location (Default: `INBOX`)
+  - `maildir_path` - str: Full path for mailbox maildir location (Default: `INBOX`)
   - `maildir_create` - bool: Create maildir if not present (Default: False)
 
 - `webhook` - Post the individual reports to a webhook url with the report as the JSON body
   - `aggregate_url` - str: URL of the webhook which should receive the aggregate reports
-  - `forensic_url` - str: URL of the webhook which should receive the forensic reports
+  - `failure_url` - str: URL of the webhook which should receive the failure reports
   - `smtp_tls_url` - str: URL of the webhook which should receive the smtp_tls reports
   - `timeout` - int: Interval in which the webhook call should timeout
 
@@ -389,26 +814,26 @@ blocks DNS requests to outside resolvers.
 :::
 
 :::{note}
-`save_aggregate` and `save_forensic` are separate options
-because you may not want to save forensic reports
-(also known as failure reports) to your Elasticsearch instance,
+`save_aggregate` and `save_failure` are separate options
+because you may not want to save failure reports
+(formerly known as forensic reports) to your Elasticsearch instance,
 particularly if you are in a highly-regulated industry that
 handles sensitive data, such as healthcare or finance. If your
 legitimate outgoing email fails DMARC, it is possible
-that email may appear later in a forensic report.
+that email may appear later in a failure report.
 
-Forensic reports contain the original headers of an email that
+Failure reports contain the original headers of an email that
 failed a DMARC check, and sometimes may also include the
 full message body, depending on the policy of the reporting
 organization.
 
-Most reporting organizations do not send forensic reports of any
+Most reporting organizations do not send failure reports of any
 kind for privacy reasons. While aggregate DMARC reports are sent
-at least daily, it is normal to receive very few forensic reports.
+at least daily, it is normal to receive very few failure reports.
 
-An alternative approach is to still collect forensic/failure/ruf
+An alternative approach is to still collect failure/ruf
 reports in your DMARC inbox, but run `parsedmarc` with
-```save_forensic = True``` manually on a separate IMAP folder (using
+```save_failure = True``` manually on a separate IMAP folder (using
 the ```reports_folder``` option), after you have manually moved
 known samples you want to save to that folder
 (e.g. malicious samples and non-sensitive legitimate samples).
@@ -437,7 +862,7 @@ Update the limit to 2k per example:
 PUT _cluster/settings
 {
   "persistent" : {
-    "cluster.max_shards_per_node" : 2000 
+    "cluster.max_shards_per_node" : 2000
   }
 }
 ```
@@ -445,10 +870,322 @@ PUT _cluster/settings
 Increasing this value increases resource usage.
 :::
 
+### Mailbox messages are only archived once the reports are saved
+
+parsedmarc processes a mailbox in batches of `batch_size` messages. Each
+batch is written to every configured output destination *before* any of
+that batch's messages are archived or deleted. If any destination reports a
+failure — an Elasticsearch outage, an expired Splunk HEC token, an
+unreachable Kafka broker, a full `--output` disk — the whole batch is left
+in the reports folder and retried on the next run or watch-mode check, so a
+report is never removed from the mailbox while it exists nowhere else
+([issue #242](https://github.com/domainaware/parsedmarc/issues/242)).
+
+This is all-or-nothing per batch: archiving a batch because most
+destinations accepted it would still permanently lose the data for the one
+that didn't. It also applies regardless of `fail_on_output_error`, which
+only controls the process exit code. Messages that could not be parsed at
+all carry no report data, so they are filed under `Invalid` (or deleted per
+`delete_invalid`) as usual.
+
+A destination that is broken rather than briefly unavailable would
+otherwise be retried forever, so retries are capped. Once a message's batch
+has failed `max_unsaved_retries + 1` times (three times by default), that
+message is moved to `<archive_folder>/Unsaved` and stops being retried. **A
+message is never deleted on this path, whatever the `delete` options say.**
+To recover after fixing the output destination, either move the messages
+from `Archive/Unsaved` back into the reports folder, or run parsedmarc once
+with `reports_folder = Archive/Unsaved`.
+
+:::{note}
+The failure counts live in memory, so they are counted per parsedmarc
+process. In watch mode — a long-running process that checks the mailbox
+repeatedly — the cap works as described across checks. A one-shot run
+(`cron`, `systemd` timers) attempts each message exactly once and then
+exits, so its counts start over every time and the default cap is never
+reached: messages simply keep being retried on every run, which is the
+safe direction. Set `max_unsaved_retries = 0` if you want one-shot runs to
+move unsavable messages to `Unsaved` immediately instead.
+:::
+
+:::{warning}
+Retrying a batch means re-sending it. Output destinations that
+deduplicate — Elasticsearch, OpenSearch, and PostgreSQL, which recognize
+an already-saved report — are unaffected, and S3 is idempotent because
+each report is written to an object key built from its type, date, and
+report ID, so a retry overwrites the same object. Kafka,
+Splunk HEC, syslog, GELF, webhooks, Azure Log Analytics, and the
+`--output` JSON/CSV files all append unconditionally, so each retry adds
+another copy of every report in the batch. That is why the default retry
+cap is deliberately low: at most three deliveries per report before its
+message is set aside in `Unsaved`. The summary email covers everything
+parsed in a run, including reports whose batch failed to save, so a report
+retried across runs can also appear in more than one summary email.
+:::
+
+:::{note}
+Not every destination can report a failed delivery. The webhook output
+deliberately logs and swallows its own HTTP and network errors, and the
+syslog and GELF outputs send through Python logging handlers, which
+swallow delivery errors by design — so an unreachable webhook, syslog, or
+GELF endpoint is *not* treated as a failed save and does not hold a
+batch's messages back. Failures in Elasticsearch, OpenSearch, Splunk HEC,
+Kafka, S3, PostgreSQL, Azure Log Analytics, and the `--output` files are
+all detected and do.
+:::
+
+:::{note}
+`since` interacts with retries: a message that ages out of the configured
+`since` window stops being fetched, and therefore stops being retried
+automatically. It is never deleted or moved — it simply stays in the
+reports folder until it is processed by a run with a wider (or no)
+`since` window.
+:::
+
+## Environment variable configuration
+
+Any configuration option can be set via environment variables using the
+naming convention `PARSEDMARC_{SECTION}_{KEY}` (uppercase). This is
+especially useful for Docker deployments where file permissions make it
+difficult to use config files for secrets.
+
+**Priority order:** CLI arguments > environment variables > config file > defaults
+
+### Examples
+
+```bash
+# Set IMAP credentials via env vars
+export PARSEDMARC_IMAP_HOST=imap.example.com
+export PARSEDMARC_IMAP_USER=dmarc@example.com
+export PARSEDMARC_IMAP_PASSWORD=secret
+
+# Elasticsearch
+export PARSEDMARC_ELASTICSEARCH_HOSTS=http://localhost:9200
+export PARSEDMARC_ELASTICSEARCH_SSL=false
+
+# Splunk HEC (note: section name splunk_hec becomes SPLUNK_HEC)
+export PARSEDMARC_SPLUNK_HEC_URL=https://splunk.example.com
+export PARSEDMARC_SPLUNK_HEC_TOKEN=my-hec-token
+export PARSEDMARC_SPLUNK_HEC_INDEX=email
+
+# General settings
+export PARSEDMARC_GENERAL_SAVE_AGGREGATE=true
+export PARSEDMARC_GENERAL_DEBUG=true
+```
+
+### Specifying the config file via environment variable
+
+```bash
+export PARSEDMARC_CONFIG_FILE=/etc/parsedmarc.ini
+parsedmarc
+```
+
+### Running without a config file (env-only mode)
+
+When no config file is given (neither `-c` flag nor `PARSEDMARC_CONFIG_FILE`),
+parsedmarc will still pick up any `PARSEDMARC_*` environment variables. This
+enables fully file-less deployments:
+
+```bash
+export PARSEDMARC_GENERAL_SAVE_AGGREGATE=true
+export PARSEDMARC_GENERAL_OFFLINE=true
+export PARSEDMARC_ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+parsedmarc /path/to/reports/*
+```
+
+### Docker Compose example
+
+```yaml
+services:
+  parsedmarc:
+    image: parsedmarc:latest
+    environment:
+      PARSEDMARC_IMAP_HOST: imap.example.com
+      PARSEDMARC_IMAP_USER: dmarc@example.com
+      PARSEDMARC_IMAP_PASSWORD: ${IMAP_PASSWORD}
+      PARSEDMARC_MAILBOX_WATCH: "true"
+      PARSEDMARC_ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      PARSEDMARC_GENERAL_SAVE_AGGREGATE: "true"
+      PARSEDMARC_GENERAL_SAVE_FAILURE: "true"
+```
+
+### Docker secrets (`_FILE` suffix)
+
+Any `PARSEDMARC_{SECTION}_{KEY}` environment variable can also be supplied
+via a file by appending `_FILE` to its name. The file's contents (with any
+trailing CR/LF characters stripped) are used as the value. This is the
+same convention used by the official Postgres, MariaDB, and Redis container
+images, and is designed to plug straight into Docker / Docker Compose /
+Kubernetes secrets so credentials never appear in plain `environment:`
+blocks (where they would be readable via `docker inspect`, container logs,
+and `/proc/<pid>/environ`).
+
+The bare `DEBUG` / `PARSEDMARC_DEBUG` aliases and `PARSEDMARC_CONFIG_FILE`
+do not have a `_FILE` form; only `PARSEDMARC_{SECTION}_{KEY}` vars resolved
+to a known config section are eligible.
+
+If both the direct env var and the `_FILE` variant are set, the `_FILE`
+variant wins. If the file does not exist or is unreadable, parsedmarc
+exits with a configuration error rather than silently falling back to an
+empty value.
+
+```yaml
+secrets:
+  imap_password:
+    file: ./secrets/imap_password.txt
+
+services:
+  parsedmarc:
+    image: parsedmarc:latest
+    secrets:
+      - imap_password
+    environment:
+      PARSEDMARC_IMAP_HOST: imap.example.com
+      PARSEDMARC_IMAP_USER: dmarc@example.com
+      PARSEDMARC_IMAP_PASSWORD_FILE: /run/secrets/imap_password
+```
+
+Note that a small set of config keys whose own names already end in
+`_file` (`[general] log_file`, `[msgraph] token_file`,
+`[gmail_api] credentials_file`, `[gmail_api] token_file`) keep their
+pre-existing meaning when set via `PARSEDMARC_..._FILE` — that env var is
+the path itself, not a wrapper around a file containing the path. To pass
+*those* paths via a Docker secret, double up the suffix
+(`PARSEDMARC_GMAIL_API_CREDENTIALS_FILE_FILE`); the inner contents are
+then read and stored as the `credentials_file` value.
+
+### Section name mapping
+
+For sections with underscores in the name, the full section name is used:
+
+| Section | Env var prefix |
+| --- | --- |
+| `general` | `PARSEDMARC_GENERAL_` |
+| `mailbox` | `PARSEDMARC_MAILBOX_` |
+| `imap` | `PARSEDMARC_IMAP_` |
+| `msgraph` | `PARSEDMARC_MSGRAPH_` |
+| `elasticsearch` | `PARSEDMARC_ELASTICSEARCH_` |
+| `opensearch` | `PARSEDMARC_OPENSEARCH_` |
+| `splunk_hec` | `PARSEDMARC_SPLUNK_HEC_` |
+| `kafka` | `PARSEDMARC_KAFKA_` |
+| `smtp` | `PARSEDMARC_SMTP_` |
+| `s3` | `PARSEDMARC_S3_` |
+| `syslog` | `PARSEDMARC_SYSLOG_` |
+| `gmail_api` | `PARSEDMARC_GMAIL_API_` |
+| `maildir` | `PARSEDMARC_MAILDIR_` |
+| `log_analytics` | `PARSEDMARC_LOG_ANALYTICS_` |
+| `gelf` | `PARSEDMARC_GELF_` |
+| `webhook` | `PARSEDMARC_WEBHOOK_` |
+
+## Using parsedmarc as a library
+
+`parsedmarc` is also importable as a regular Python package, not just a CLI
+tool. The main entry points — `parse_report_file()`, `parse_aggregate_report_xml()`,
+`parse_aggregate_report_file()`, `parse_failure_report()`, `parse_report_email()`,
+`get_dmarc_reports_from_mbox()`, `get_dmarc_reports_from_mailbox()`, and
+`watch_inbox()` — are all importable
+directly from the `parsedmarc` package. See the [API reference](api.md) for
+the full set of modules and members.
+
+Each of these functions accepts either individual option keyword arguments
+(`offline`, `nameservers`, `dns_timeout`, etc.) or a single `config=` keyword
+argument carrying a `ParserConfig` instance:
+
+```python
+from parsedmarc import ParserConfig, parse_report_file, get_dmarc_reports_from_mailbox
+from parsedmarc.mail import IMAPConnection
+
+config = ParserConfig(
+    offline=False,
+    nameservers=["1.1.1.1", "1.0.0.1"],
+    dns_timeout=5.0,
+)
+
+report = parse_report_file("aggregate_report.xml.gz", config=config)
+
+connection = IMAPConnection(
+    host="imap.example.com", user="dmarc@example.com", password="..."
+)
+results = get_dmarc_reports_from_mailbox(connection, config=config)
+```
+
+A few things to keep in mind:
+
+- When `config=` is passed, the individual option keyword arguments are
+  ignored in favor of the values carried on the `ParserConfig` instance.
+- Each explicitly constructed `ParserConfig` owns its own isolated caches
+  (IP address info, seen aggregate report IDs, and the reverse DNS map).
+  Omitting `config=` falls back to the process-wide caches shared by every
+  call that doesn't pass one.
+- `keep_alive` and `n_procs` are not part of `ParserConfig` — they control
+  process/worker orchestration rather than parsing or enrichment behavior,
+  so they are always passed as separate keyword arguments.
+
+## Performance tuning
+
+For large mailbox imports or backfills, parsedmarc can consume a noticeable amount
+of memory, especially when it runs on the same host as Elasticsearch or
+OpenSearch. The following settings can reduce peak memory usage and make long
+imports more predictable:
+
+- Reduce `mailbox.batch_size` to smaller values such as `100-500` instead of
+  processing a very large message set at once. Smaller batches trade throughput
+  for lower peak memory use and less sink pressure.
+- `n_procs` now parallelizes parsing for mailbox and mbox runs too, not just
+  report files passed directly as CLI arguments. It pays off most when a run
+  is bound by DNS/GeoIP enrichment rather than fetching or output. The
+  trade-off is memory and DNS load: at most roughly `2 * n_procs` messages
+  are held in flight at once, each worker process keeps its own DNS/GeoIP
+  cache, and DNS query volume can multiply by up to `n_procs`.
+- Use `mailbox.since` to process reports in smaller time windows such as `1d`,
+  `7d`, or another interval that fits the backlog. This makes it easier to catch
+  up incrementally instead of loading an entire mailbox history in one run.
+- Set `strip_attachment_payloads = True` when failure reports contain large
+  attachments and you do not need to retain the raw payloads in the parsed
+  output.
+- Prefer running parsedmarc separately from Elasticsearch or OpenSearch, or
+  reserve enough RAM for both services if they must share a host.
+- For very large imports, prefer incremental supervised runs, such as a
+  scheduler or systemd service, over infrequent massive backfills.
+
+These are operational tuning recommendations rather than hard requirements, but
+they are often enough to avoid memory pressure and reduce failures during
+high-volume mailbox processing.
+
+## Multi-tenant support
+
+Starting in `8.19.0`, ParseDMARC provides multi-tenant support by placing data into separate OpenSearch or Elasticsearch index prefixes. To set this up, create a YAML file that is formatted where each key is a tenant name, and the value is a list of domains related to that tenant, not including subdomains, like this:
+
+```yaml
+example:
+  - example.com
+  - example.net
+  - example.org
+
+whalensolutions:
+  - whalensolutions.com
+```
+
+Save it to disk where the user running ParseDMARC can read it, then set `index_prefix_domain_map` to that filepath in the `[general]` section of the ParseDMARC configuration file and do not set an `index_prefix` option in the `[elasticsearch]` or `[opensearch]` sections.
+
+When configured correctly, if ParseDMARC finds that a report is related to a domain in the mapping, the report will be saved in an index name that has the tenant name prefixed to it with a trailing underscore. Then, you can use the security features of OpenSearch or the ELK stack to only grant users access to the indexes that they need.
+
+ :::{note}
+ A domain cannot be used in multiple tenant lists. Only the first prefix list that contains the matching domain is used.
+:::
+
+Each key must be a tenant name and each value a *list* of domain names, all strings; a file of any other shape is rejected at startup.
+
+The index migrations and backfills that run at startup cover every tenant prefix in the map, in addition to the unprefixed indexes that hold reports for domains the map does not list. A configuration reload (`SIGHUP`) re-reads the map, so a newly onboarded tenant is covered without restarting parsedmarc. See [Backfilling the combined DKIM/SPF result fields](elasticsearch.md#backfilling-the-combined-dkimspf-result-fields) for the details.
+
 ## Running parsedmarc as a systemd service
 
 Use systemd to run `parsedmarc` as a service and process reports as
 they arrive.
+
+This assumes `parsedmarc` has been installed into
+`/opt/parsedmarc/venv` under a `parsedmarc` system user, as described
+in [Installing parsedmarc](installation.md#installing-parsedmarc).
 
 Protect the `parsedmarc` configuration file from prying eyes
 
@@ -472,6 +1209,9 @@ After=network.target network-online.target elasticsearch.service
 
 [Service]
 ExecStart=/opt/parsedmarc/venv/bin/parsedmarc -c /etc/parsedmarc.ini
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=60
 User=parsedmarc
 Group=parsedmarc
 Restart=always
@@ -504,6 +1244,62 @@ sudo service parsedmarc restart
 
 :::
 
+:::{note}
+On `systemctl stop`/`restart` (or Ctrl-C) `parsedmarc` finishes the
+current batch, flushes its outputs, and exits cleanly. Shutdown is
+observed at batch boundaries, so the worst-case delay is roughly
+`mailbox_check_timeout` (default 30s) plus the batch's processing and
+flush time. Keep `TimeoutStopSec` comfortably above
+`mailbox_check_timeout` (≈2×, and raise both together) or systemd will
+`SIGKILL` mid-batch. In the foreground, a second Ctrl-C force-quits
+immediately, skipping the output flush.
+:::
+
+### Reloading configuration without restarting
+
+When running in watch mode, `parsedmarc` supports reloading its
+configuration file without restarting the service or interrupting
+report processing that is already in progress. Send a `SIGHUP` signal
+to the process, or use `systemctl reload` if the unit file includes
+the `ExecReload` line shown above:
+
+```bash
+sudo systemctl reload parsedmarc
+```
+
+The reload takes effect after the current batch of reports finishes
+processing and all output operations (Elasticsearch, Kafka, S3, etc.)
+for that batch have completed. The following settings are reloaded:
+
+- All output destinations (Elasticsearch, OpenSearch, Kafka, S3,
+  Splunk, syslog, GELF, webhooks, Log Analytics)
+- Multi-tenant index prefix domain map (`index_prefix_domain_map` —
+  the referenced YAML file is re-read on reload)
+- DNS and GeoIP settings (`nameservers`, `dns_timeout`, `ip_db_path`,
+  `ip_db_url`, `offline`, etc.)
+- Processing flags (`strip_attachment_payloads`, `batch_size`,
+  `check_timeout`, etc.)
+- Log level (`debug`, `verbose`, `warnings`, `silent`)
+
+Mailbox connection settings (IMAP host/credentials, Microsoft Graph,
+Gmail API, Maildir path) are **not** reloaded — changing those still
+requires a full restart.
+
+On a **successful** reload, existing output client connections are
+closed and new ones are created from the updated configuration. The
+service then resumes watching with the new settings.
+
+If the new configuration file contains errors (missing required
+settings, unreachable output destinations, etc.), the **entire reload
+is aborted** — no output clients are replaced and the previous
+configuration remains fully active. This means a typo in one section
+will not take down an otherwise working setup. Check the logs for
+details:
+
+```bash
+journalctl -u parsedmarc.service -r
+```
+
 To check the status of the service, run:
 
 ```bash
@@ -524,3 +1320,4 @@ journalctl -u parsedmarc.service -r
 
 [cloudflare's public resolvers]: https://1.1.1.1/
 [url encoded]: https://en.wikipedia.org/wiki/Percent-encoding#Percent-encoding_reserved_characters
+[ipinfo lite rest api]: https://ipinfo.io/developers/lite-api

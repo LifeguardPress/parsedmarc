@@ -1,0 +1,11 @@
+apiVersion: v2
+name: parsedmarc
+description: Run parsedmarc with Gmail, Elasticsearch, and Kibana integration
+type: application
+version: 0.1.0
+appVersion: "master"
+keywords:
+  - dmarc
+  - email
+  - parsedmarc
+
